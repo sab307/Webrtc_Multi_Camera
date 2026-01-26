@@ -1,4 +1,4 @@
-// Main Application Logic
+// Main Application Logic with Clock Synchronization Display
 let webrtcClient = null;
 let currentStreams = [];
 let currentStreamId = null;
@@ -6,7 +6,7 @@ let metricsUpdateInterval = null;
 
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', async () => {
-    console.log('Initializing ROS2 WebRTC Streaming...');
+    console.log('Initializing ROS2 WebRTC Streaming with Clock Sync...');
     
     await initWebRTC();
 });
@@ -41,6 +41,11 @@ async function initWebRTC() {
         webrtcClient.onConnectionStateChange = (state) => {
             updateConnectionStatus(state);
         };
+        
+        // NEW: Clock synchronization callback
+        webrtcClient.onClockSync = (syncStats) => {
+            updateClockSyncDisplay(syncStats);
+        };
 
         // Connect
         updateConnectionStatus('connecting');
@@ -52,6 +57,88 @@ async function initWebRTC() {
         updateConnectionStatus('failed');
     }
 }
+
+// ==================== CLOCK SYNC UI ====================
+
+function updateClockSyncDisplay(syncStats) {
+    // Update the clock sync panel
+    const offsetValue = document.getElementById('clockOffset');
+    const rttValue = document.getElementById('clockRtt');
+    const jitterValue = document.getElementById('clockJitter');
+    const samplesValue = document.getElementById('clockSamples');
+    const syncIndicator = document.getElementById('clockSyncIndicator');
+    const offsetDirection = document.getElementById('offsetDirection');
+    
+    if (offsetValue) {
+        const absOffset = Math.abs(syncStats.offset);
+        offsetValue.textContent = absOffset.toFixed(2) + 'ms';
+        
+        // Color code based on offset magnitude
+        if (absOffset < 10) {
+            offsetValue.style.color = '#48bb78'; // Green - excellent
+        } else if (absOffset < 50) {
+            offsetValue.style.color = '#ecc94b'; // Yellow - acceptable
+        } else {
+            offsetValue.style.color = '#f56565'; // Red - poor
+        }
+    }
+    
+    if (offsetDirection) {
+        if (syncStats.offset > 0) {
+            offsetDirection.textContent = '(Server ahead)';
+            offsetDirection.className = 'offset-direction server-ahead';
+        } else {
+            offsetDirection.textContent = '(Client ahead)';
+            offsetDirection.className = 'offset-direction client-ahead';
+        }
+    }
+    
+    if (rttValue) {
+        rttValue.textContent = syncStats.avgRtt.toFixed(2) + 'ms';
+    }
+    
+    if (jitterValue) {
+        jitterValue.textContent = syncStats.jitter.toFixed(2) + 'ms';
+    }
+    
+    if (samplesValue) {
+        samplesValue.textContent = syncStats.samples;
+    }
+    
+    if (syncIndicator) {
+        syncIndicator.className = 'sync-indicator synced';
+        syncIndicator.title = 'Clock synchronized';
+    }
+    
+    // Update detail view clock panel if visible
+    updateDetailClockDisplay(syncStats);
+}
+
+function updateDetailClockDisplay(syncStats) {
+    const detailOffset = document.getElementById('detailClockOffset');
+    const detailRtt = document.getElementById('detailClockRtt');
+    const detailMinRtt = document.getElementById('detailMinRtt');
+    const detailMaxRtt = document.getElementById('detailMaxRtt');
+    const detailStdDev = document.getElementById('detailStdDev');
+    
+    if (detailOffset) {
+        detailOffset.textContent = syncStats.offset.toFixed(2) + 'ms';
+    }
+    if (detailRtt) {
+        detailRtt.textContent = syncStats.avgRtt.toFixed(2) + 'ms';
+    }
+    if (detailMinRtt) {
+        detailMinRtt.textContent = syncStats.minRtt.toFixed(2) + 'ms';
+    }
+    if (detailMaxRtt) {
+        detailMaxRtt.textContent = syncStats.maxRtt.toFixed(2) + 'ms';
+    }
+    if (detailStdDev) {
+        detailStdDev.textContent = syncStats.stdDev.toFixed(2) + 'ms';
+    }
+}
+
+// ==================== CONNECTION STATUS ====================
 
 function updateConnectionStatus(state) {
     const indicator = document.getElementById('statusIndicator');
@@ -69,10 +156,11 @@ function updateConnectionStatus(state) {
     text.textContent = statusText[state] || state;
 }
 
+// ==================== STREAM GRID ====================
+
 function addStreamToGrid(trackId, stream) {
     console.log('addStreamToGrid called for:', trackId);
     
-    // Add to current streams
     if (!currentStreams.includes(trackId)) {
         currentStreams.push(trackId);
         updateStreamCount();
@@ -80,19 +168,16 @@ function addStreamToGrid(trackId, stream) {
 
     const grid = document.getElementById('streamGrid');
     
-    // Remove loading message if it exists
     const loading = grid.querySelector('.loading');
     if (loading) {
         loading.remove();
     }
 
-    // Check if card already exists
     if (document.getElementById(`card-${trackId}`)) {
         console.log('Card already exists for:', trackId);
         return;
     }
 
-    // Create stream card
     const card = document.createElement('div');
     card.className = 'stream-card';
     card.id = `card-${trackId}`;
@@ -105,36 +190,32 @@ function addStreamToGrid(trackId, stream) {
     video.muted = true;
     video.srcObject = stream;
     
-    // Debug: log when video gets data
     video.onloadedmetadata = () => {
-        console.log(`📺 Video ${trackId} metadata loaded:`, video.videoWidth, 'x', video.videoHeight);
+        console.log(`Video ${trackId} metadata loaded:`, video.videoWidth, 'x', video.videoHeight);
     };
     
     video.onloadeddata = () => {
-        console.log(`📺 Video ${trackId} data loaded`);
+        console.log(`Video ${trackId} data loaded`);
     };
     
     video.onplay = () => {
-        console.log(`📺 Video ${trackId} started playing`);
+        console.log(`Video ${trackId} started playing`);
     };
     
     video.onerror = (e) => {
-        console.error(`📺 Video ${trackId} error:`, e);
+        console.error(`Video ${trackId} error:`, e);
     };
     
-    // Force play with retry
     const playVideo = async () => {
         try {
             await video.play();
             console.log(`Video ${trackId} playing`);
         } catch (err) {
             console.warn(`Video ${trackId} play failed:`, err.message);
-            // Retry after a short delay
             setTimeout(playVideo, 500);
         }
     };
     
-    // Start playing once added to DOM
     setTimeout(playVideo, 100);
 
     const info = document.createElement('div');
@@ -169,7 +250,6 @@ function addStreamToGrid(trackId, stream) {
     
     console.log('Stream card created for:', trackId);
     
-    // Monitor the video track state
     const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack) {
         console.log('📹 Video track state:', videoTrack.readyState, 'enabled:', videoTrack.enabled, 'muted:', videoTrack.muted);
@@ -192,7 +272,6 @@ function addStreamToGrid(trackId, stream) {
             if (statusEl) statusEl.textContent = '● Live';
         };
         
-        // Update status based on current state
         if (videoTrack.readyState === 'live' && !videoTrack.muted) {
             const statusEl = document.getElementById(`card-status-${trackId}`);
             if (statusEl) statusEl.textContent = '● Live';
@@ -209,7 +288,6 @@ function removeStreamFromGrid(trackId) {
         card.remove();
     }
 
-    // Show loading message if no streams
     if (currentStreams.length === 0) {
         const grid = document.getElementById('streamGrid');
         grid.innerHTML = `
@@ -221,8 +299,9 @@ function removeStreamFromGrid(trackId) {
     }
 }
 
+// ==================== METRICS ====================
+
 function updateMetrics(metricsMap) {
-    // Update grid card metrics
     currentStreams.forEach(trackId => {
         const metrics = metricsMap.get(trackId);
         if (metrics) {
@@ -238,7 +317,6 @@ function updateMetrics(metricsMap) {
         }
     });
 
-    // Update detail view if open
     if (currentStreamId) {
         const metrics = metricsMap.get(currentStreamId);
         if (metrics) {
@@ -248,16 +326,21 @@ function updateMetrics(metricsMap) {
 }
 
 function updateDetailMetrics(metrics) {
-    // Update stats
     document.getElementById('totalLatency').textContent = Math.round(metrics.totalLatency || 0) + 'ms';
     document.getElementById('frameCount').textContent = metrics.frameCount || 0;
     
     if (metrics.width && metrics.height) {
         document.getElementById('resolution').textContent = `${metrics.width}x${metrics.height}`;
     }
+    
+    // Show clock sync status in metrics
+    const clockSyncStatus = document.getElementById('clockSyncStatus');
+    if (clockSyncStatus) {
+        clockSyncStatus.textContent = metrics.clockSynced ? '✓ Synced' : '○ Not synced';
+        clockSyncStatus.style.color = metrics.clockSynced ? '#48bb78' : '#ecc94b';
+    }
 
-    // Update latency bars
-    const totalLatency = metrics.totalLatency || 1; // Avoid division by zero
+    const totalLatency = metrics.totalLatency || 1;
     
     const rosLatency = metrics.rosLatency || 0;
     const processingLatency = metrics.processingLatency || 0;
@@ -275,47 +358,50 @@ function updateDetailMetrics(metrics) {
     document.getElementById('renderLatencyBar').style.width = Math.min((renderLatency / totalLatency * 100), 100) + '%';
 }
 
+// ==================== DETAIL VIEW ====================
+
 function showDetail(streamId) {
     console.log('Showing detail for:', streamId);
     currentStreamId = streamId;
 
-    // Get stream
     const stream = webrtcClient.getStream(streamId);
     if (!stream) {
         console.error('Stream not found:', streamId);
         return;
     }
 
-    // Hide dashboard, show detail
     document.getElementById('dashboardView').style.display = 'none';
     document.getElementById('detailView').style.display = 'block';
 
-    // Update title
     document.getElementById('streamTitle').textContent = formatStreamName(streamId);
 
-    // Attach stream to video
     const video = document.getElementById('detailVideo');
     video.srcObject = stream;
     video.play().catch(err => console.warn('Detail video play error:', err.message));
 
-    // Update metrics immediately
     const metrics = webrtcClient.getMetrics(streamId);
     if (metrics) {
         updateDetailMetrics(metrics);
+    }
+    
+    // Update clock sync display in detail view
+    const clockStats = webrtcClient.getClockSyncStats();
+    if (clockStats) {
+        updateDetailClockDisplay(clockStats);
     }
 }
 
 function showDashboard() {
     currentStreamId = null;
     
-    // Show dashboard, hide detail
     document.getElementById('dashboardView').style.display = 'block';
     document.getElementById('detailView').style.display = 'none';
 
-    // Clear detail video
     const video = document.getElementById('detailVideo');
     video.srcObject = null;
 }
+
+// ==================== UTILITIES ====================
 
 function formatStreamName(streamId) {
     return streamId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());

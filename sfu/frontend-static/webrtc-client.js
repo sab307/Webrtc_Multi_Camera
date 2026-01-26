@@ -1,4 +1,4 @@
-// WebRTC Client for ROS2 Streaming
+// WebRTC Client for ROS2 Streaming with Clock Synchronization
 class WebRTCClient {
     constructor(signalingUrl) {
         this.signalingUrl = signalingUrl;
@@ -10,12 +10,233 @@ class WebRTCClient {
         this.videoElements = new Map(); // trackId -> video element
         this.clientId = null;
         
+        // ==================== CLOCK SYNCHRONIZATION STATE ====================
+        this.clockOffset = 0;           // Server time - Client time (ms)
+        this.clockOffsetSamples = [];   // History of offset measurements
+        this.rttSamples = [];           // History of RTT measurements
+        this.pendingPings = new Map();  // pingId -> {sendTime}
+        this.clockSyncInterval = null;
+        this.clockSynced = false;
+        this.lastSyncTime = null;
+        
         // Callbacks
         this.onStreamAdded = null;
         this.onStreamRemoved = null;
         this.onMetricsUpdate = null;
         this.onConnectionStateChange = null;
+        this.onClockSync = null;        // New callback for clock sync updates
     }
+    
+    // ==================== CLOCK SYNCHRONIZATION ====================
+    
+    /**
+     * Start the clock synchronization process.
+     * Uses NTP-style ping/pong to measure RTT and calculate clock offset.
+     * 
+     * Algorithm:
+     *   t1 = client send time
+     *   t2 = server receive time
+     *   t3 = server send time
+     *   t4 = client receive time
+     *   
+     *   RTT = (t4 - t1) - (t3 - t2)
+     *   Offset = ((t2 - t1) + (t3 - t4)) / 2
+     *   
+     * The offset tells us: server_time = client_time + offset
+     */
+    startClockSync() {
+        console.log('Starting clock synchronization...');
+        
+        // Send initial burst of pings for quick sync (5 pings, 200ms apart)
+        for (let i = 0; i < 5; i++) {
+            setTimeout(() => this.sendPing(), i * 200);
+        }
+        
+        // Then sync periodically (every 5 seconds) to maintain accuracy
+        this.clockSyncInterval = setInterval(() => {
+            this.sendPing();
+        }, 5000);
+    }
+    
+    stopClockSync() {
+        if (this.clockSyncInterval) {
+            clearInterval(this.clockSyncInterval);
+            this.clockSyncInterval = null;
+        }
+    }
+    
+    sendPing() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        
+        const pingId = Math.random().toString(36).substring(2, 10);
+        const t1 = Date.now(); // Client send time (absolute)
+        
+        this.pendingPings.set(pingId, {
+            t1: t1
+        });
+        
+        this.sendMessage({
+            type: 'ping',
+            ping_id: pingId,
+            client_time: t1  // Send absolute time to server
+        });
+        
+        // Timeout - remove stale pings after 5 seconds
+        setTimeout(() => {
+            if (this.pendingPings.has(pingId)) {
+                this.pendingPings.delete(pingId);
+                console.warn('Ping timeout:', pingId);
+            }
+        }, 5000);
+    }
+    
+    handlePong(msg) {
+        const t4 = Date.now(); // Client receive time
+        
+        const pingData = this.pendingPings.get(msg.ping_id);
+        if (!pingData) {
+            console.warn('Unknown pong received:', msg.ping_id);
+            return;
+        }
+        
+        this.pendingPings.delete(msg.ping_id);
+        
+        // NTP-style timestamps:
+        const t1 = pingData.t1;          // Client send time
+        const t2 = msg.server_receive;   // Server receive time
+        const t3 = msg.server_send;      // Server send time (often same as t2)
+        // t4 = client receive time (already set above)
+        
+        // NTP-style calculation:
+        // RTT = (t4 - t1) - (t3 - t2)  [total round trip minus server processing]
+        // Offset = ((t2 - t1) + (t3 - t4)) / 2
+        
+        const serverProcessing = t3 - t2;
+        const rtt = (t4 - t1) - serverProcessing;
+        const offset = ((t2 - t1) + (t3 - t4)) / 2;
+        
+        // Store samples (keep last 10 for median calculation)
+        this.rttSamples.push(rtt);
+        this.clockOffsetSamples.push(offset);
+        
+        if (this.rttSamples.length > 10) {
+            this.rttSamples.shift();
+        }
+        if (this.clockOffsetSamples.length > 10) {
+            this.clockOffsetSamples.shift();
+        }
+        
+        // Calculate median offset (more robust than mean against outliers)
+        const sortedOffsets = [...this.clockOffsetSamples].sort((a, b) => a - b);
+        const medianOffset = sortedOffsets[Math.floor(sortedOffsets.length / 2)];
+        
+        // Calculate RTT stats
+        const avgRtt = this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length;
+        const minRtt = Math.min(...this.rttSamples);
+        const maxRtt = Math.max(...this.rttSamples);
+        
+        // Standard deviation of offset
+        const avgOffset = this.clockOffsetSamples.reduce((a, b) => a + b, 0) / this.clockOffsetSamples.length;
+        const variance = this.clockOffsetSamples.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / this.clockOffsetSamples.length;
+        const stdDev = Math.sqrt(variance);
+        
+        // Update the clock offset (use median for robustness)
+        this.clockOffset = medianOffset;
+        this.clockSynced = true;
+        this.lastSyncTime = Date.now();
+        
+        const syncStats = {
+            offset: this.clockOffset,
+            offsetDirection: this.clockOffset > 0 ? 'Server ahead' : 'Client ahead',
+            rtt: rtt,
+            avgRtt: avgRtt,
+            minRtt: minRtt,
+            maxRtt: maxRtt,
+            jitter: maxRtt - minRtt,
+            stdDev: stdDev,
+            samples: this.clockOffsetSamples.length,
+            serverTime: t2,
+            clientTime: t1,
+            t1: t1,
+            t2: t2,
+            t3: t3,
+            t4: t4
+        };
+        
+        // Log sync details (first 5 samples, then every 5th)
+        if (this.clockOffsetSamples.length <= 5 || this.clockOffsetSamples.length % 5 === 0) {
+            console.log(`Clock Sync #${this.clockOffsetSamples.length}:`);
+            console.log(`├─ Clock Offset: ${this.clockOffset.toFixed(2)}ms (${syncStats.offsetDirection})`);
+            console.log(`├─ RTT: ${rtt.toFixed(2)}ms (avg: ${avgRtt.toFixed(2)}ms)`);
+            console.log(`├─ Jitter: ${syncStats.jitter.toFixed(2)}ms`);
+            console.log(`└─ Std Dev: ${stdDev.toFixed(2)}ms`);
+        }
+        
+        // Callback for UI updates
+        if (this.onClockSync) {
+            this.onClockSync(syncStats);
+        }
+    }
+    
+    /**
+     * Convert a server timestamp to client time
+     * @param {number} serverTime - Timestamp from server
+     * @returns {number} Equivalent client time
+     */
+    serverToClientTime(serverTime) {
+        return serverTime - this.clockOffset;
+    }
+    
+    /**
+     * Convert a client timestamp to server time
+     * @param {number} clientTime - Timestamp from client
+     * @returns {number} Equivalent server time
+     */
+    clientToServerTime(clientTime) {
+        return clientTime + this.clockOffset;
+    }
+    
+    /**
+     * Get the current time synchronized to server clock
+     * @returns {number} Current time in server's reference frame
+     */
+    getSyncedServerTime() {
+        return Date.now() + this.clockOffset;
+    }
+    
+    /**
+     * Get comprehensive clock sync statistics
+     * @returns {Object|null} Clock sync stats or null if not synced
+     */
+    getClockSyncStats() {
+        if (!this.clockSynced) {
+            return null;
+        }
+        
+        const avgRtt = this.rttSamples.length > 0 
+            ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+            : 0;
+        
+        const avgOffset = this.clockOffsetSamples.reduce((a, b) => a + b, 0) / this.clockOffsetSamples.length;
+        const variance = this.clockOffsetSamples.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / this.clockOffsetSamples.length;
+            
+        return {
+            offset: this.clockOffset,
+            offsetDirection: this.clockOffset > 0 ? 'Server ahead' : 'Client ahead',
+            avgRtt: avgRtt,
+            minRtt: this.rttSamples.length > 0 ? Math.min(...this.rttSamples) : 0,
+            maxRtt: this.rttSamples.length > 0 ? Math.max(...this.rttSamples) : 0,
+            jitter: this.rttSamples.length > 0 ? Math.max(...this.rttSamples) - Math.min(...this.rttSamples) : 0,
+            stdDev: Math.sqrt(variance),
+            samples: this.clockOffsetSamples.length,
+            synced: this.clockSynced,
+            lastSyncTime: this.lastSyncTime
+        };
+    }
+
+    // ==================== CONNECTION ====================
 
     async connect() {
         return new Promise((resolve, reject) => {
@@ -26,6 +247,10 @@ class WebRTCClient {
             this.ws.onopen = () => {
                 console.log('WebSocket connected');
                 this.setupWebRTC();
+                
+                // Start clock synchronization immediately after WebSocket connects
+                this.startClockSync();
+                
                 resolve();
             };
 
@@ -35,7 +260,8 @@ class WebRTCClient {
             };
 
             this.ws.onclose = () => {
-                console.log('🔌 WebSocket disconnected');
+                console.log('WebSocket disconnected');
+                this.stopClockSync();
                 if (this.onConnectionStateChange) {
                     this.onConnectionStateChange('disconnected');
                 }
@@ -54,7 +280,7 @@ class WebRTCClient {
     }
 
     setupWebRTC() {
-        console.log('🎥 Setting up WebRTC...');
+        console.log('Setting up WebRTC...');
 
         const configuration = {
             iceServers: [
@@ -66,7 +292,6 @@ class WebRTCClient {
         this.pc = new RTCPeerConnection(configuration);
 
         // Create data channel for receiving metrics (must be created by offerer)
-        // Note: We create it BEFORE any handlers to ensure we don't miss events
         const dcOptions = { 
             ordered: false,
             maxRetransmits: 0  // Unreliable for low latency
@@ -74,11 +299,10 @@ class WebRTCClient {
         this.dataChannel = this.pc.createDataChannel('metrics', dcOptions);
         console.log('Created data channel, initial state:', this.dataChannel.readyState);
         
-        // Set up data channel handlers immediately
+        // Set up data channel handlers
         const setupDataChannelHandlers = (dc, label) => {
             console.log(`Setting up handlers for data channel: ${label}, state: ${dc.readyState}`);
             
-            // If already open, fire our handler
             if (dc.readyState === 'open') {
                 console.log(`Data channel ${label} already OPEN!`);
             }
@@ -95,20 +319,17 @@ class WebRTCClient {
                 console.error(`Data channel ${label} error:`, error);
             };
             
-            // Track message count to reduce log spam
             let dcMsgCount = 0;
             
             dc.onmessage = (event) => {
                 dcMsgCount++;
                 try {
-                    // Handle both string and binary data
                     let jsonStr;
                     if (typeof event.data === 'string') {
                         jsonStr = event.data;
                     } else if (event.data instanceof ArrayBuffer) {
                         jsonStr = new TextDecoder().decode(event.data);
                     } else if (event.data instanceof Blob) {
-                        // Blob needs async handling - skip for now, WebSocket works
                         return;
                     } else {
                         return;
@@ -119,7 +340,6 @@ class WebRTCClient {
                         this.handleMetrics(data.data, data.timestamp);
                     }
                 } catch (error) {
-                    // Only log first few errors
                     if (dcMsgCount <= 3) {
                         console.warn(`Data channel parse error (msg #${dcMsgCount}), using WebSocket fallback`);
                     }
@@ -136,15 +356,12 @@ class WebRTCClient {
             console.log('Track kind:', event.track.kind);
             console.log('Streams:', event.streams);
             
-            // Get the track name from the stream ID
-            // Server sends stream ID as "stream_<trackName>"
             let trackId = event.track.id;
             
             if (event.streams && event.streams.length > 0) {
                 const streamId = event.streams[0].id;
                 console.log('   Stream ID:', streamId);
                 
-                // Extract track name from stream ID (format: "stream_trackName")
                 if (streamId && streamId.startsWith('stream_')) {
                     trackId = streamId.replace('stream_', '');
                     console.log('   Extracted track name:', trackId);
@@ -153,10 +370,9 @@ class WebRTCClient {
             
             const stream = event.streams[0];
             if (stream) {
-                console.log('🎬 Adding stream for track:', trackId);
+                console.log('Adding stream for track:', trackId);
                 this.streams.set(trackId, stream);
                 
-                // Initialize metrics for this track
                 this.metrics.set(trackId, {
                     frameCount: 0,
                     totalLatency: 0,
@@ -174,7 +390,6 @@ class WebRTCClient {
                     console.error('Error in onStreamAdded callback:', error);
                 }
 
-                // Setup frame callback for metrics
                 try {
                     this.setupFrameCallback(trackId, stream);
                 } catch (error) {
@@ -245,24 +460,10 @@ class WebRTCClient {
             
             if (this.pc.connectionState === 'connected') {
                 console.log('Peer connection connected - checking data channel...');
-                // Data channel should be open once peer connection is connected
                 setTimeout(() => {
                     console.log('Data channel state 1s after connected:', this.dataChannel.readyState);
                     if (this.dataChannel.readyState === 'open') {
                         console.log('Data channel confirmed OPEN - ready to receive metrics');
-                    } else {
-                        console.error('Data channel still not open after 1s:', this.dataChannel.readyState);
-                    }
-                }, 1000);
-                
-                // Also check every second for 10 seconds
-                let checkCount = 0;
-                const interval = setInterval(() => {
-                    checkCount++;
-                    console.log(`Data channel check #${checkCount}:`, this.dataChannel.readyState, 
-                        'bufferedAmount:', this.dataChannel.bufferedAmount);
-                    if (this.dataChannel.readyState === 'open' || checkCount >= 10) {
-                        clearInterval(interval);
                     }
                 }, 1000);
             }
@@ -274,73 +475,26 @@ class WebRTCClient {
 
         this.pc.oniceconnectionstatechange = () => {
             console.log('ICE connection state:', this.pc.iceConnectionState);
-            console.log('Data channel state at ICE change:', this.dataChannel.readyState);
         };
 
         this.pc.onicegatheringstatechange = () => {
             console.log('ICE gathering state:', this.pc.iceGatheringState);
         };
-        
-        // Monitor SCTP transport state if available
-        if (this.pc.sctp) {
-            console.log('SCTP transport available:', this.pc.sctp.state);
-            this.pc.sctp.onstatechange = () => {
-                console.log('SCTP transport state:', this.pc.sctp.state);
-            };
-        } else {
-            console.log('SCTP transport not yet available');
-            // Check periodically
-            const checkSctp = setInterval(() => {
-                if (this.pc.sctp) {
-                    console.log('SCTP transport now available:', this.pc.sctp.state);
-                    this.pc.sctp.onstatechange = () => {
-                        console.log('SCTP transport state changed:', this.pc.sctp.state);
-                    };
-                    clearInterval(checkSctp);
-                }
-            }, 500);
-            setTimeout(() => clearInterval(checkSctp), 10000);
-        }
 
         // Join as viewer
         this.sendMessage({
             type: 'join',
             role: 'viewer'
         });
-        
-        // IMPORTANT: Start polling for data channel state
-        // This catches cases where callbacks might not fire
-        let pollCount = 0;
-        const pollInterval = setInterval(() => {
-            pollCount++;
-            const dcState = this.dataChannel ? this.dataChannel.readyState : 'no channel';
-            const pcState = this.pc ? this.pc.connectionState : 'no pc';
-            const iceState = this.pc ? this.pc.iceConnectionState : 'no pc';
-            
-            // Only log first 5 polls
-            if (pollCount <= 5) {
-                console.log(`Poll #${pollCount}: DC=${dcState}, PC=${pcState}, ICE=${iceState}`);
-            }
-            
-            if (dcState === 'open' && pollCount <= 5) {
-                console.log('Data channel is OPEN! (detected via polling)');
-            }
-            
-            if (pollCount >= 5 || dcState === 'open') {
-                clearInterval(pollInterval);
-            }
-        }, 1000);
     }
 
     setupFrameCallback(trackId, stream) {
-        // Create a hidden video element for frame callbacks
         const video = document.createElement('video');
         video.srcObject = stream;
         video.muted = true;
         video.playsInline = true;
         video.autoplay = true;
         
-        // Need to play to trigger frame callbacks
         video.play().catch(e => {
             console.warn('Video play error (hidden element):', e.message);
         });
@@ -353,7 +507,6 @@ class WebRTCClient {
             const timeSinceLastFrame = now - lastFrameTime;
             lastFrameTime = now;
 
-            // Update metrics
             const metrics = this.metrics.get(trackId) || {};
             metrics.renderLatency = timeSinceLastFrame;
             metrics.frameCount = frameCount;
@@ -366,7 +519,6 @@ class WebRTCClient {
 
             this.metrics.set(trackId, metrics);
 
-            // Continue requesting frames
             if (video.requestVideoFrameCallback) {
                 video.requestVideoFrameCallback(callback);
             }
@@ -380,7 +532,6 @@ class WebRTCClient {
     }
 
     handleMetrics(metricsData, timestamp) {
-        // Only log first 3 metrics messages
         if (!this._metricsLogCount) this._metricsLogCount = 0;
         this._metricsLogCount++;
         const shouldLog = this._metricsLogCount <= 3;
@@ -389,7 +540,24 @@ class WebRTCClient {
             console.log('handleMetrics called:', { metricsData, timestamp });
         }
         
-        const networkTime = Date.now() - (timestamp * 1000);
+        // Use synchronized clock for accurate network latency calculation
+        let networkTime;
+        if (this.clockSynced) {
+            // Convert server timestamp to client time, then compare with now
+            const serverTimeMs = timestamp * 1000;
+            const clientEquivalent = this.serverToClientTime(serverTimeMs);
+            networkTime = Date.now() - clientEquivalent;
+            
+            if (shouldLog) {
+                console.log('Using synchronized clock for network latency:', networkTime.toFixed(2), 'ms');
+            }
+        } else {
+            // Fallback: naive calculation (may be inaccurate if clocks differ)
+            networkTime = Date.now() - (timestamp * 1000);
+            if (shouldLog) {
+                console.log('Clock not synced, using naive network latency:', networkTime.toFixed(2), 'ms');
+            }
+        }
 
         for (const [trackId, trackMetrics] of Object.entries(metricsData)) {
             const existing = this.metrics.get(trackId) || {};
@@ -400,10 +568,10 @@ class WebRTCClient {
                 encodingLatency: trackMetrics.encoding_latency || 0,
                 networkLatency: Math.max(0, networkTime),
                 processingLatency: (trackMetrics.ros_latency || 0) + (trackMetrics.encoding_latency || 0),
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                clockSynced: this.clockSynced
             };
 
-            // Calculate total latency
             combined.totalLatency = 
                 combined.rosLatency + 
                 combined.encodingLatency + 
@@ -424,7 +592,13 @@ class WebRTCClient {
     async handleSignalingMessage(msg) {
         console.log('Received message:', msg.type);
         
-        // Handle metrics directly via WebSocket (in addition to data channel)
+        // Handle pong for clock synchronization
+        if (msg.type === 'pong') {
+            this.handlePong(msg);
+            return;
+        }
+        
+        // Handle metrics directly via WebSocket
         if (msg.type === 'metrics') {
             if (!this._wsMetricsCount) this._wsMetricsCount = 0;
             this._wsMetricsCount++;
@@ -441,30 +615,17 @@ class WebRTCClient {
                 console.log('Joined as client:', msg.client_id);
                 console.log('Available streams:', msg.streams);
                 
-                // Check data channel state before offer
-                console.log('Data channel state before offer:', this.dataChannel.readyState);
-                
-                // Add one transceiver for EACH available stream
                 const streamCount = msg.streams ? msg.streams.length : 1;
                 console.log(`📹 Adding ${streamCount} video transceiver(s) for streams`);
                 for (let i = 0; i < Math.max(1, streamCount); i++) {
                     this.pc.addTransceiver('video', { direction: 'recvonly' });
-                    console.log(`   Added transceiver ${i + 1}/${streamCount}`);
                 }
                 
-                // Create offer
                 const offer = await this.pc.createOffer();
                 
-                // Log if offer contains data channel (m=application)
                 if (offer.sdp.includes('m=application')) {
                     console.log('Offer includes data channel (m=application)');
-                } else {
-                    console.warn('Offer does NOT include data channel!');
                 }
-                
-                // Count m=video lines in offer
-                const videoLines = (offer.sdp.match(/m=video/g) || []).length;
-                console.log(`📹 Offer contains ${videoLines} video section(s)`);
                 
                 await this.pc.setLocalDescription(offer);
                 
@@ -481,7 +642,6 @@ class WebRTCClient {
             case 'answer':
                 console.log('Received answer');
                 try {
-                    // Handle both formats: {type, sdp} object or just the SDP string
                     let answerSdp;
                     if (msg.sdp && typeof msg.sdp === 'object') {
                         answerSdp = msg.sdp.sdp || msg.sdp;
@@ -489,11 +649,8 @@ class WebRTCClient {
                         answerSdp = msg.sdp;
                     }
                     
-                    // Log if answer contains data channel
                     if (answerSdp && answerSdp.includes('m=application')) {
                         console.log('Answer includes data channel (m=application)');
-                    } else {
-                        console.warn('Answer does NOT include data channel!');
                     }
                     
                     const answer = new RTCSessionDescription({
@@ -502,19 +659,6 @@ class WebRTCClient {
                     });
                     await this.pc.setRemoteDescription(answer);
                     console.log('Set remote description');
-                    console.log('Data channel state after answer:', this.dataChannel.readyState);
-                    
-                    // Monitor data channel state changes
-                    const checkDataChannel = () => {
-                        console.log('Data channel state check:', this.dataChannel.readyState);
-                        if (this.dataChannel.readyState === 'open') {
-                            console.log('Data channel is now OPEN!');
-                        } else if (this.dataChannel.readyState !== 'closed') {
-                            setTimeout(checkDataChannel, 500);
-                        }
-                    };
-                    setTimeout(checkDataChannel, 500);
-                    
                 } catch (e) {
                     console.error('Error setting remote description:', e);
                 }
@@ -570,7 +714,9 @@ class WebRTCClient {
     }
 
     cleanup() {
-        console.log('🧹 Cleaning up...');
+        console.log('Cleaning up...');
+        
+        this.stopClockSync();
 
         if (this.dataChannel) {
             this.dataChannel.close();
@@ -589,6 +735,9 @@ class WebRTCClient {
 
         this.streams.clear();
         this.metrics.clear();
+        this.pendingPings.clear();
+        this.clockOffsetSamples = [];
+        this.rttSamples = [];
         
         this.videoElements.forEach(video => {
             video.srcObject = null;

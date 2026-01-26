@@ -11,9 +11,19 @@
     <header class="header">
         <div class="container">
             <h1>🎥 ROS2 WebRTC Streaming</h1>
-            <div class="connection-status">
-                <div class="status-indicator" id="statusIndicator"></div>
-                <span id="statusText">Disconnected</span>
+            <div class="header-right">
+                <!-- Clock Sync Status (compact) -->
+                <div class="clock-sync-compact">
+                    <div class="sync-indicator" id="clockSyncIndicator" title="Clock not synchronized"></div>
+                    <span class="sync-label">Clock:</span>
+                    <span class="sync-value" id="clockOffset">--</span>
+                    <span class="offset-direction" id="offsetDirection"></span>
+                </div>
+                
+                <div class="connection-status">
+                    <div class="status-indicator" id="statusIndicator"></div>
+                    <span id="statusText">Disconnected</span>
+                </div>
             </div>
         </div>
     </header>
@@ -23,6 +33,37 @@
         <!-- Dashboard View (Grid) -->
         <div id="dashboardView" class="dashboard-view">
             <div class="container">
+                <!-- Clock Sync Panel -->
+                <div class="clock-sync-panel">
+                    <h3>Clock Synchronization</h3>
+                    <div class="clock-sync-grid">
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Clock Offset</span>
+                            <span class="clock-stat-value" id="clockOffset">--</span>
+                            <span class="clock-stat-desc">Difference between server and client clocks</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">RTT (Avg)</span>
+                            <span class="clock-stat-value" id="clockRtt">--</span>
+                            <span class="clock-stat-desc">Round-trip time to server</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Jitter</span>
+                            <span class="clock-stat-value" id="clockJitter">--</span>
+                            <span class="clock-stat-desc">RTT variation (max - min)</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Samples</span>
+                            <span class="clock-stat-value" id="clockSamples">0</span>
+                            <span class="clock-stat-desc">Number of sync measurements</span>
+                        </div>
+                    </div>
+                    <p class="clock-sync-explanation">
+                        <strong>How it works:</strong> NTP-style ping/pong measures 4 timestamps (t1→t2→t3→t4) to calculate 
+                        <code>offset = ((t2-t1) + (t3-t4)) / 2</code>. Positive offset means server clock is ahead.
+                    </p>
+                </div>
+
                 <h2>Live Camera Streams</h2>
                 <div id="streamGrid" class="stream-grid">
                     <div class="loading">
@@ -44,6 +85,7 @@
                             <video id="detailVideo" class="detail-video" autoplay playsinline></video>
                             <div class="video-overlay">
                                 <span class="live-indicator">● LIVE</span>
+                                <span class="clock-sync-badge" id="clockSyncStatus">○ Not synced</span>
                             </div>
                         </div>
                         
@@ -62,6 +104,33 @@
                                     <span class="stat-label">Resolution</span>
                                     <span class="stat-value" id="resolution">N/A</span>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Clock Sync Detail Panel -->
+                    <div class="clock-section">
+                        <h3>Clock Synchronization Details</h3>
+                        <div class="clock-detail-grid">
+                            <div class="clock-detail-item">
+                                <span class="label">Clock Offset</span>
+                                <span class="value" id="detailClockOffset">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Avg RTT</span>
+                                <span class="value" id="detailClockRtt">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Min RTT</span>
+                                <span class="value" id="detailMinRtt">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Max RTT</span>
+                                <span class="value" id="detailMaxRtt">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Std Dev</span>
+                                <span class="value" id="detailStdDev">--</span>
                             </div>
                         </div>
                     </div>
@@ -99,7 +168,7 @@
                                 <div class="latency-bar">
                                     <div class="latency-fill network" id="networkLatencyBar"></div>
                                 </div>
-                                <p class="latency-desc">Publisher → SFU → Browser (WebRTC)</p>
+                                <p class="latency-desc">Publisher → SFU → Browser (WebRTC) — <em>clock-synced</em></p>
                             </div>
 
                             <div class="latency-item">
@@ -122,7 +191,7 @@
     <!-- Footer -->
     <footer class="footer">
         <div class="container">
-            <p>ROS2 WebRTC Streaming System • <span id="streamCount">0</span> active streams</p>
+            <p>ROS2 WebRTC Streaming System • <span id="streamCount">0</span> active streams • Clock sync enabled</p>
         </div>
     </footer>
 
