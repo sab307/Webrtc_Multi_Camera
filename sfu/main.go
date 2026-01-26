@@ -172,7 +172,7 @@ func main() {
 
 	// Start HTTPS server
 	bindAddr := fmt.Sprintf("%s:%s", *host, *port)
-	log.Printf("🎧 Binding to: %s", bindAddr)
+	log.Printf("Binding to: %s", bindAddr)
 	err := http.ListenAndServeTLS(bindAddr, certPath, keyPath, nil)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
