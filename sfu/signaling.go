@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -77,6 +78,85 @@ var (
 	clientsMu sync.RWMutex
 )
 
+// ============================================================
+// CLOCK SYNCHRONIZATION TYPES AND HANDLER
+// ============================================================
+
+// PingMessage represents a clock sync ping from the client
+type PingMessage struct {
+	Type       string `json:"type"`
+	PingID     string `json:"ping_id"`
+	ClientTime int64  `json:"client_time"` // Client's timestamp in milliseconds
+}
+
+// PongMessage represents the server's response with timestamps
+type PongMessage struct {
+	Type          string `json:"type"`
+	PingID        string `json:"ping_id"`
+	ClientTime    int64  `json:"client_time"`    // Echo back client's send time (t1)
+	ServerReceive int64  `json:"server_receive"` // Server receive time (t2)
+	ServerSend    int64  `json:"server_send"`    // Server send time (t3)
+}
+
+// handlePing processes a clock sync ping and sends a pong response
+// This implements NTP-style clock synchronization:
+//
+//	Client                          Server
+//	------                          ------
+//	t1 (send ping) ----[ping]---->
+//	                                t2 (receive ping)
+//	                                t3 (send pong)
+//	               <----[pong]----
+//	t4 (receive pong)
+//
+// Client calculates:
+//   - RTT = (t4 - t1) - (t3 - t2)
+//   - Offset = ((t2 - t1) + (t3 - t4)) / 2
+func handlePing(client *Client, msgData []byte) {
+	// Record server receive time IMMEDIATELY (t2)
+	// This must be the first operation for accuracy
+	serverReceiveTime := time.Now().UnixMilli()
+
+	// Parse the ping message
+	var ping PingMessage
+	if err := json.Unmarshal(msgData, &ping); err != nil {
+		log.Printf("Failed to parse ping from %s: %v", client.ID, err)
+		return
+	}
+
+	// Create pong response with all timestamps
+	pong := PongMessage{
+		Type:          "pong",
+		PingID:        ping.PingID,
+		ClientTime:    ping.ClientTime,
+		ServerReceive: serverReceiveTime,
+		ServerSend:    time.Now().UnixMilli(), // t3 - record just before sending
+	}
+
+	// Send pong response
+	client.mu.Lock()
+	err := client.Conn.WriteJSON(pong)
+	client.mu.Unlock()
+
+	if err != nil {
+		log.Printf("Failed to send pong to %s: %v", client.ID, err)
+		return
+	}
+
+	// Log occasionally for debugging (not every ping to avoid spam)
+	if clockSyncLogCount < 5 || clockSyncLogCount%100 == 0 {
+		log.Printf("Clock sync ping from %s: client_t1=%d, server_t2=%d, server_t3=%d",
+			client.ID, ping.ClientTime, serverReceiveTime, pong.ServerSend)
+	}
+	clockSyncLogCount++
+}
+
+var clockSyncLogCount int64
+
+// ============================================================
+// WEBSOCKET SIGNALING HANDLER
+// ============================================================
+
 // handleSignaling handles WebSocket signaling for a single connection
 func handleSignaling(ws *websocket.Conn) {
 	clientID := uuid.New().String()
@@ -114,13 +194,21 @@ func handleSignaling(ws *websocket.Conn) {
 			continue
 		}
 
-		handleMessage(client, &message)
+		// Handle message (pass raw bytes for ping to preserve timing accuracy)
+		handleMessage(client, &message, msg)
 	}
 }
 
 // handleMessage processes incoming signaling messages
-func handleMessage(client *Client, msg *SignalingMessage) {
+func handleMessage(client *Client, msg *SignalingMessage, rawMsg []byte) {
 	switch msg.Type {
+	// ============================================================
+	// CLOCK SYNC - Handle ping messages for time synchronization
+	// ============================================================
+	case "ping":
+		handlePing(client, rawMsg)
+
+	// Standard signaling messages
 	case "join":
 		handleJoin(client, msg)
 	case "offer":
@@ -143,7 +231,7 @@ func handleJoin(client *Client, msg *SignalingMessage) {
 	client.Streams = msg.Streams
 	client.mu.Unlock()
 
-	log.Printf("👤 Client %s joined as %s", client.ID, msg.Role)
+	log.Printf("Client %s joined as %s", client.ID, msg.Role)
 
 	// Send joined confirmation
 	response := SignalingMessage{
