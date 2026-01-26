@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ROS2 WebRTC Streaming</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <h1>🎥 ROS2 WebRTC Streaming</h1>
+            <div class="connection-status">
+                <div class="status-indicator" id="statusIndicator"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main" id="mainContent">
+        <!-- Dashboard View (Grid) -->
+        <div id="dashboardView" class="dashboard-view">
+            <div class="container">
+                <h2>Live Camera Streams</h2>
+                <div id="streamGrid" class="stream-grid">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Waiting for streams...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Detail View (Single Stream) -->
+        <div id="detailView" class="detail-view" style="display: none;">
+            <div class="container">
+                <button class="back-button" onclick="showDashboard()">← Back to Grid</button>
+                
+                <div class="detail-content">
+                    <div class="video-section">
+                        <div class="video-wrapper">
+                            <video id="detailVideo" class="detail-video" autoplay playsinline></video>
+                            <div class="video-overlay">
+                                <span class="live-indicator">● LIVE</span>
+                            </div>
+                        </div>
+                        
+                        <div class="stream-info">
+                            <h2 id="streamTitle">Stream Name</h2>
+                            <div class="stats-row">
+                                <div class="stat">
+                                    <span class="stat-label">Total Latency</span>
+                                    <span class="stat-value" id="totalLatency">0ms</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Frame Count</span>
+                                    <span class="stat-value" id="frameCount">0</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Resolution</span>
+                                    <span class="stat-value" id="resolution">N/A</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="latency-section">
+                        <h3>Latency Breakdown</h3>
+                        <div class="latency-bars">
+                            <div class="latency-item">
+                                <div class="latency-header">
+                                    <span>ROS2 Image Time</span>
+                                    <span id="rosLatency">0ms</span>
+                                </div>
+                                <div class="latency-bar">
+                                    <div class="latency-fill ros" id="rosLatencyBar"></div>
+                                </div>
+                                <p class="latency-desc">ROS2 message timestamp → image capture</p>
+                            </div>
+
+                            <div class="latency-item">
+                                <div class="latency-header">
+                                    <span>Preprocessing (Encoding)</span>
+                                    <span id="processingLatency">0ms</span>
+                                </div>
+                                <div class="latency-bar">
+                                    <div class="latency-fill processing" id="processingLatencyBar"></div>
+                                </div>
+                                <p class="latency-desc">H.264 encoding + RTP packetization</p>
+                            </div>
+
+                            <div class="latency-item">
+                                <div class="latency-header">
+                                    <span>Network Transmission</span>
+                                    <span id="networkLatency">0ms</span>
+                                </div>
+                                <div class="latency-bar">
+                                    <div class="latency-fill network" id="networkLatencyBar"></div>
+                                </div>
+                                <p class="latency-desc">Publisher → SFU → Browser (WebRTC)</p>
+                            </div>
+
+                            <div class="latency-item">
+                                <div class="latency-header">
+                                    <span>Rendering (Decoding)</span>
+                                    <span id="renderLatency">0ms</span>
+                                </div>
+                                <div class="latency-bar">
+                                    <div class="latency-fill rendering" id="renderLatencyBar"></div>
+                                </div>
+                                <p class="latency-desc">H.264 decode → GPU render → display</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>ROS2 WebRTC Streaming System • <span id="streamCount">0</span> active streams</p>
+        </div>
+    </footer>
+
+    <script src="webrtc-client.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
