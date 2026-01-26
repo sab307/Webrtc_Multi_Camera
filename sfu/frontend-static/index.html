@@ -35,7 +35,7 @@
             <div class="container">
                 <!-- Clock Sync Panel -->
                 <div class="clock-sync-panel">
-                    <h3>Clock Synchronization</h3>
+                    <h3>⏱️ Clock Synchronization</h3>
                     <div class="clock-sync-grid">
                         <div class="clock-stat">
                             <span class="clock-stat-label">Clock Offset</span>
@@ -55,12 +55,17 @@
                         <div class="clock-stat">
                             <span class="clock-stat-label">Samples</span>
                             <span class="clock-stat-value" id="clockSamples">0</span>
-                            <span class="clock-stat-desc">Number of sync measurements</span>
+                            <span class="clock-stat-desc">Accepted sync measurements</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Quality</span>
+                            <span class="clock-stat-value" id="syncQuality">--</span>
+                            <span class="clock-stat-desc">Sync stability rating</span>
                         </div>
                     </div>
                     <p class="clock-sync-explanation">
                         <strong>How it works:</strong> NTP-style ping/pong measures 4 timestamps (t1→t2→t3→t4) to calculate 
-                        <code>offset = ((t2-t1) + (t3-t4)) / 2</code>. Positive offset means server clock is ahead.
+                        <code>offset = ((t2-t1) + (t3-t4)) / 2</code>. Outliers (RTT &gt; 1s or extreme deviations) are rejected.
                     </p>
                 </div>
 
@@ -110,7 +115,7 @@
 
                     <!-- Clock Sync Detail Panel -->
                     <div class="clock-section">
-                        <h3>Clock Synchronization Details</h3>
+                        <h3>⏱️ Clock Synchronization Details</h3>
                         <div class="clock-detail-grid">
                             <div class="clock-detail-item">
                                 <span class="label">Clock Offset</span>

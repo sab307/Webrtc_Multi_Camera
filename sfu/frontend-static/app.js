@@ -68,6 +68,7 @@ function updateClockSyncDisplay(syncStats) {
     const samplesValue = document.getElementById('clockSamples');
     const syncIndicator = document.getElementById('clockSyncIndicator');
     const offsetDirection = document.getElementById('offsetDirection');
+    const syncQualityEl = document.getElementById('syncQuality');
     
     if (offsetValue) {
         const absOffset = Math.abs(syncStats.offset);
@@ -105,9 +106,24 @@ function updateClockSyncDisplay(syncStats) {
         samplesValue.textContent = syncStats.samples;
     }
     
+    if (syncQualityEl) {
+        syncQualityEl.textContent = syncStats.syncQuality || 'Syncing...';
+        // Color code quality
+        const quality = syncStats.syncQuality || '';
+        if (quality === 'Excellent') {
+            syncQualityEl.style.color = '#48bb78';
+        } else if (quality === 'Good') {
+            syncQualityEl.style.color = '#68d391';
+        } else if (quality === 'Fair') {
+            syncQualityEl.style.color = '#ecc94b';
+        } else {
+            syncQualityEl.style.color = '#f56565';
+        }
+    }
+    
     if (syncIndicator) {
         syncIndicator.className = 'sync-indicator synced';
-        syncIndicator.title = 'Clock synchronized';
+        syncIndicator.title = `Clock synchronized (${syncStats.syncQuality || 'Syncing'})`;
     }
     
     // Update detail view clock panel if visible
@@ -252,7 +268,7 @@ function addStreamToGrid(trackId, stream) {
     
     const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack) {
-        console.log('📹 Video track state:', videoTrack.readyState, 'enabled:', videoTrack.enabled, 'muted:', videoTrack.muted);
+        console.log('Video track state:', videoTrack.readyState, 'enabled:', videoTrack.enabled, 'muted:', videoTrack.muted);
         
         videoTrack.onended = () => {
             console.log(`Video track ${trackId} ended`);
