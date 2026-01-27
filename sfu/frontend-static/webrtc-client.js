@@ -11,20 +11,24 @@ class WebRTCClient {
         this.clientId = null;
         
         // ==================== CLOCK SYNCHRONIZATION STATE ====================
-        this.clockOffset = 0;           // Server time - Client time (ms)
-        this.clockOffsetSamples = [];   // History of offset measurements
-        this.rttSamples = [];           // History of RTT measurements
-        this.pendingPings = new Map();  // pingId -> {sendTime}
+        // Stores {offset, rtt, timestamp} objects for quality-based filtering
+        this.clockSyncSamples = [];
+        this.rttSamples = [];           // Derived from best clockSyncSamples
+        this.pendingPings = new Map();  // pingId -> {t1}
         this.clockSyncInterval = null;
+        this.clockOffset = 0;           // Server time - Client time (ms)
         this.clockSynced = false;
         this.lastSyncTime = null;
+        
+        // Adaptive clock skew detection threshold
+        this.CLOCK_SKEW_THRESHOLD = 1000; // ms - if raw latency > this, apply compensation
         
         // Callbacks
         this.onStreamAdded = null;
         this.onStreamRemoved = null;
         this.onMetricsUpdate = null;
         this.onConnectionStateChange = null;
-        this.onClockSync = null;        // New callback for clock sync updates
+        this.onClockSync = null;        // Callback for clock sync updates
     }
     
     // ==================== CLOCK SYNCHRONIZATION ====================
@@ -106,140 +110,116 @@ class WebRTCClient {
         // NTP-style timestamps:
         const t1 = pingData.t1;          // Client send time
         const t2 = msg.server_receive;   // Server receive time
-        const t3 = msg.server_send;      // Server send time (often same as t2)
+        const t3 = msg.server_send;      // Server send time
         // t4 = client receive time (already set above)
         
-        // NTP-style calculation:
-        // RTT = (t4 - t1) - (t3 - t2)  [total round trip minus server processing]
-        // Offset = ((t2 - t1) + (t3 - t4)) / 2
+        // Calculate RTT and offset
+        const rtt = (t4 - t1) - (t3 - t2);
+        const oneWayDelay = rtt / 2;
         
-        const serverProcessing = t3 - t2;
-        const rtt = (t4 - t1) - serverProcessing;
-        const offset = ((t2 - t1) + (t3 - t4)) / 2;
+        // Offset calculation: server_time + one_way_delay should equal our receive_time
+        // offset = server_time - client_time (positive = server ahead)
+        const offset = (t2 + oneWayDelay) - t4;
         
         // ============================================================
-        // OUTLIER FILTERING - Reject bad samples
+        // OUTLIER FILTERING - Reject bad samples based on RTT
         // ============================================================
         
-        // Filter 1: Reject if RTT is unreasonably high (> 1000ms)
-        // High RTT indicates network congestion - offset calculation unreliable
-        const MAX_VALID_RTT = 1000; // ms
+        // Filter 1: Reject if RTT is too high (network congestion)
+        const MAX_VALID_RTT = 500; // ms - stricter threshold
         if (rtt > MAX_VALID_RTT || rtt < 0) {
-            console.warn(`Rejected sample: RTT ${rtt.toFixed(2)}ms out of range`);
-            return;
-        }
-        
-        // Filter 2: Reject if offset is wildly different from existing samples
-        // Only apply after we have some baseline samples
-        if (this.clockOffsetSamples.length >= 3) {
-            const sortedExisting = [...this.clockOffsetSamples].sort((a, b) => a - b);
-            const currentMedian = sortedExisting[Math.floor(sortedExisting.length / 2)];
-            
-            // Calculate IQR (Interquartile Range) for robust outlier detection
-            const q1Index = Math.floor(sortedExisting.length * 0.25);
-            const q3Index = Math.floor(sortedExisting.length * 0.75);
-            const q1 = sortedExisting[q1Index];
-            const q3 = sortedExisting[q3Index];
-            const iqr = q3 - q1;
-            
-            // Use adaptive threshold: max of IQR-based or fixed minimum
-            // This handles both stable and variable network conditions
-            const minThreshold = 100; // Always allow at least 100ms deviation
-            const iqrThreshold = Math.max(iqr * 3, minThreshold);
-            
-            // Also use absolute maximum deviation (e.g., 5000ms = 5 seconds)
-            const maxDeviation = Math.min(iqrThreshold, 5000);
-            
-            const deviation = Math.abs(offset - currentMedian);
-            if (deviation > maxDeviation) {
-                console.warn(`Rejected outlier: offset ${offset.toFixed(2)}ms deviates ${deviation.toFixed(2)}ms from median ${currentMedian.toFixed(2)}ms (threshold: ${maxDeviation.toFixed(2)}ms)`);
-                return;
-            }
-        }
-        
-        // Filter 3: Sanity check - offset shouldn't be more than a few seconds
-        // unless clocks are REALLY misconfigured
-        const MAX_REASONABLE_OFFSET = 10000; // 10 seconds
-        if (Math.abs(offset) > MAX_REASONABLE_OFFSET && this.clockOffsetSamples.length === 0) {
-            console.warn(`First sample has extreme offset: ${offset.toFixed(2)}ms - accepting but monitoring`);
-            // Accept first sample even if extreme, but log warning
-        } else if (Math.abs(offset) > MAX_REASONABLE_OFFSET) {
-            console.warn(`Rejected sample: offset ${offset.toFixed(2)}ms exceeds reasonable range`);
+            console.warn(`Rejected sample: RTT ${rtt.toFixed(2)}ms out of range (max: ${MAX_VALID_RTT}ms)`);
             return;
         }
         
         // ============================================================
-        // SAMPLE ACCEPTED - Store and calculate stats
+        // SAMPLE ACCEPTED - Store with RTT for quality-based filtering
         // ============================================================
         
-        // Store samples (keep last 10 for median calculation)
-        this.rttSamples.push(rtt);
-        this.clockOffsetSamples.push(offset);
-        
-        if (this.rttSamples.length > 10) {
-            this.rttSamples.shift();
-        }
-        if (this.clockOffsetSamples.length > 10) {
-            this.clockOffsetSamples.shift();
-        }
-        
-        // Calculate median offset (more robust than mean against outliers)
-        const sortedOffsets = [...this.clockOffsetSamples].sort((a, b) => a - b);
-        const medianOffset = sortedOffsets[Math.floor(sortedOffsets.length / 2)];
-        
-        // Calculate RTT stats
-        const avgRtt = this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length;
-        const minRtt = Math.min(...this.rttSamples);
-        const maxRtt = Math.max(...this.rttSamples);
-        
-        // Standard deviation of offset (measure of sync stability)
-        const avgOffset = this.clockOffsetSamples.reduce((a, b) => a + b, 0) / this.clockOffsetSamples.length;
-        const variance = this.clockOffsetSamples.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / this.clockOffsetSamples.length;
-        const stdDev = Math.sqrt(variance);
-        
-        // Update the clock offset (use median for robustness)
-        this.clockOffset = medianOffset;
-        this.clockSynced = true;
-        this.lastSyncTime = Date.now();
-        
-        // Calculate sync quality rating
-        let syncQuality = 'Excellent';
-        if (stdDev > 50) syncQuality = 'Good';
-        if (stdDev > 100) syncQuality = 'Fair';
-        if (stdDev > 200) syncQuality = 'Poor';
-        
-        const syncStats = {
-            offset: this.clockOffset,
-            offsetDirection: this.clockOffset > 0 ? 'Server ahead' : 'Client ahead',
+        this.clockSyncSamples.push({
+            offset: offset,
             rtt: rtt,
-            avgRtt: avgRtt,
-            minRtt: minRtt,
-            maxRtt: maxRtt,
-            jitter: maxRtt - minRtt,
-            stdDev: stdDev,
-            syncQuality: syncQuality,
-            samples: this.clockOffsetSamples.length,
-            acceptedSamples: this.clockOffsetSamples.length,
-            serverTime: t2,
-            clientTime: t1,
-            t1: t1,
-            t2: t2,
-            t3: t3,
-            t4: t4
-        };
+            timestamp: t4
+        });
         
-        // Log sync details (first 5 samples, then every 5th)
-        if (this.clockOffsetSamples.length <= 5 || this.clockOffsetSamples.length % 5 === 0) {
-            console.log(`Clock Sync #${this.clockOffsetSamples.length} [${syncQuality}]:`);
-            console.log(`├─ Clock Offset: ${this.clockOffset.toFixed(2)}ms (${syncStats.offsetDirection})`);
-            console.log(`├─ RTT: ${rtt.toFixed(2)}ms (avg: ${avgRtt.toFixed(2)}ms)`);
-            console.log(`├─ Jitter: ${syncStats.jitter.toFixed(2)}ms`);
-            console.log(`└─ Std Dev: ${stdDev.toFixed(2)}ms`);
+        // Keep last 20 samples
+        if (this.clockSyncSamples.length > 20) {
+            this.clockSyncSamples.shift();
         }
         
-        // Callback for UI updates
-        if (this.onClockSync) {
-            this.onClockSync(syncStats);
+        // ============================================================
+        // IMPROVED: Use median offset from samples with LOWEST RTT
+        // This gives more accurate sync by prioritizing best network conditions
+        // ============================================================
+        
+        if (this.clockSyncSamples.length >= 3) {
+            // Sort by RTT and take the best 50% of samples
+            const sortedByRTT = [...this.clockSyncSamples].sort((a, b) => a.rtt - b.rtt);
+            const bestSamples = sortedByRTT.slice(0, Math.ceil(sortedByRTT.length / 2));
+            
+            // Calculate median offset from best samples
+            const offsets = bestSamples.map(s => s.offset).sort((a, b) => a - b);
+            const medianOffset = offsets[Math.floor(offsets.length / 2)];
+            
+            // Calculate RTT stats from best samples
+            const rtts = bestSamples.map(s => s.rtt);
+            const avgRtt = rtts.reduce((a, b) => a + b, 0) / rtts.length;
+            const minRtt = Math.min(...rtts);
+            const maxRtt = Math.max(...rtts);
+            
+            // Update the clock offset
+            this.clockOffset = medianOffset;
+            this.clockSynced = true;
+            this.lastSyncTime = Date.now();
+            
+            // Store RTT samples for stats
+            this.rttSamples = rtts;
+            
+            // Calculate sync quality
+            const allOffsets = this.clockSyncSamples.map(s => s.offset);
+            const avgOffset = allOffsets.reduce((a, b) => a + b, 0) / allOffsets.length;
+            const variance = allOffsets.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / allOffsets.length;
+            const stdDev = Math.sqrt(variance);
+            
+            // Determine sync quality rating
+            let syncQuality = 'Excellent';
+            if (stdDev > 20) syncQuality = 'Good';
+            if (stdDev > 50) syncQuality = 'Fair';
+            if (stdDev > 100) syncQuality = 'Poor';
+            
+            const syncStats = {
+                offset: this.clockOffset,
+                offsetDirection: this.clockOffset > 0 ? 'Server ahead' : 'Client ahead',
+                rtt: rtt,
+                avgRtt: avgRtt,
+                minRtt: minRtt,
+                maxRtt: maxRtt,
+                jitter: maxRtt - minRtt,
+                stdDev: stdDev,
+                syncQuality: syncQuality,
+                samples: this.clockSyncSamples.length,
+                usedSamples: bestSamples.length,
+                t1: t1,
+                t2: t2,
+                t3: t3,
+                t4: t4
+            };
+            
+            // Log sync details
+            if (this.clockSyncSamples.length <= 5 || this.clockSyncSamples.length % 5 === 0) {
+                console.log(` Clock Sync #${this.clockSyncSamples.length} [${syncQuality}]:`);
+                console.log(` ├─ Offset: ${this.clockOffset.toFixed(2)}ms (${syncStats.offsetDirection})`);
+                console.log(` ├─ RTT: ${rtt.toFixed(2)}ms (avg of best: ${avgRtt.toFixed(2)}ms)`);
+                console.log(` ├─ Using ${bestSamples.length}/${this.clockSyncSamples.length} best samples`);
+                console.log(` └─ Std Dev: ${stdDev.toFixed(2)}ms`);
+            }
+            
+            // Callback for UI updates
+            if (this.onClockSync) {
+                this.onClockSync(syncStats);
+            }
+        } else {
+            console.log(`Collecting samples: ${this.clockSyncSamples.length}/3 (RTT: ${rtt.toFixed(2)}ms)`);
         }
     }
     
@@ -282,8 +262,13 @@ class WebRTCClient {
             ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
             : 0;
         
-        const avgOffset = this.clockOffsetSamples.reduce((a, b) => a + b, 0) / this.clockOffsetSamples.length;
-        const variance = this.clockOffsetSamples.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / this.clockOffsetSamples.length;
+        const offsets = this.clockSyncSamples.map(s => s.offset);
+        const avgOffset = offsets.length > 0 
+            ? offsets.reduce((a, b) => a + b, 0) / offsets.length 
+            : 0;
+        const variance = offsets.length > 0 
+            ? offsets.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / offsets.length 
+            : 0;
             
         return {
             offset: this.clockOffset,
@@ -293,7 +278,7 @@ class WebRTCClient {
             maxRtt: this.rttSamples.length > 0 ? Math.max(...this.rttSamples) : 0,
             jitter: this.rttSamples.length > 0 ? Math.max(...this.rttSamples) - Math.min(...this.rttSamples) : 0,
             stdDev: Math.sqrt(variance),
-            samples: this.clockOffsetSamples.length,
+            samples: this.clockSyncSamples.length,
             synced: this.clockSynced,
             lastSyncTime: this.lastSyncTime
         };
@@ -323,7 +308,7 @@ class WebRTCClient {
             };
 
             this.ws.onclose = () => {
-                console.log('🔌 WebSocket disconnected');
+                console.log('WebSocket disconnected');
                 this.stopClockSync();
                 if (this.onConnectionStateChange) {
                     this.onConnectionStateChange('disconnected');
@@ -343,7 +328,7 @@ class WebRTCClient {
     }
 
     setupWebRTC() {
-        console.log('🎥 Setting up WebRTC...');
+        console.log('Setting up WebRTC...');
 
         const configuration = {
             iceServers: [
@@ -603,67 +588,90 @@ class WebRTCClient {
             console.log('handleMetrics called:', { metricsData, timestamp });
         }
         
-        // Calculate network latency using synchronized clock
-        let networkTime;
-        let latencyMethod = 'naive';
+        const receiveTime = Date.now();
+        const serverTimeMs = timestamp * 1000;
         
-        if (this.clockSynced) {
-            // Convert server timestamp to client time, then compare with now
-            const serverTimeMs = timestamp * 1000;
+        // ============================================================
+        // ADAPTIVE CLOCK SKEW DETECTION
+        // ============================================================
+        // Calculate raw latency (no compensation)
+        const rawLatency = receiveTime - serverTimeMs;
+        
+        // Detect if clocks are significantly out of sync
+        // - If |rawLatency| > threshold: Clocks are skewed, apply compensation
+        // - If |rawLatency| < threshold: Clocks are synced, use raw value
+        const hasClockSkew = Math.abs(rawLatency) > this.CLOCK_SKEW_THRESHOLD;
+        
+        let networkTime;
+        let latencyMethod;
+        
+        if (hasClockSkew && this.clockSynced) {
+            // =========================================================
+            // SCENARIO 1: Clock skew detected - apply compensation
+            // =========================================================
             const clientEquivalent = this.serverToClientTime(serverTimeMs);
-            networkTime = Date.now() - clientEquivalent;
-            latencyMethod = 'synced';
+            networkTime = receiveTime - clientEquivalent;
+            latencyMethod = 'compensated';
             
-            // ============================================================
-            // SANITY CHECK: Reject unreasonable network latency values
-            // ============================================================
-            
-            // If network latency is negative, something is wrong
-            // This can happen if clock sync is off or timestamp is in the future
-            if (networkTime < 0) {
-                if (shouldLog) {
-                    console.warn(`Negative network latency detected: ${networkTime.toFixed(2)}ms - using RTT/2 estimate`);
-                }
-                // Fall back to using half the average RTT as network estimate
-                const avgRtt = this.rttSamples.length > 0 
-                    ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
-                    : 10; // Default 10ms if no RTT samples
-                networkTime = avgRtt / 2;
-                latencyMethod = 'rtt-estimate';
+            if (shouldLog || this._metricsLogCount % 60 === 0) {
+                console.log(`Clock skew detected! Raw=${rawLatency.toFixed(0)}ms`);
+                console.log(`Offset: ${this.clockOffset.toFixed(2)}ms`);
+                console.log(`Compensated latency: ${networkTime.toFixed(1)}ms`);
             }
+        } else if (!hasClockSkew) {
+            // =========================================================
+            // SCENARIO 2: Clocks synced - use raw latency
+            // =========================================================
+            networkTime = rawLatency;
+            latencyMethod = 'raw';
             
-            // If network latency is unreasonably high (> 5 seconds), cap it
-            // This prevents UI from showing crazy values
-            const MAX_REASONABLE_NETWORK_LATENCY = 5000; // 5 seconds
-            if (networkTime > MAX_REASONABLE_NETWORK_LATENCY) {
-                if (shouldLog) {
-                    console.warn(`Network latency too high: ${networkTime.toFixed(2)}ms - capping at ${MAX_REASONABLE_NETWORK_LATENCY}ms`);
-                }
-                networkTime = MAX_REASONABLE_NETWORK_LATENCY;
-                latencyMethod = 'capped';
-            }
-            
-            if (shouldLog) {
-                console.log(`Network latency (${latencyMethod}): ${networkTime.toFixed(2)}ms`);
+            if (shouldLog || this._metricsLogCount % 60 === 0) {
+                console.log(`Clocks synced! Latency=${networkTime.toFixed(1)}ms (no compensation needed)`);
             }
         } else {
-            // Fallback: naive calculation (may be inaccurate if clocks differ)
-            networkTime = Date.now() - (timestamp * 1000);
-            
-            // Apply same sanity checks
-            if (networkTime < 0) {
-                networkTime = 10; // Default estimate
-                latencyMethod = 'default';
-            } else if (networkTime > 5000) {
-                networkTime = 5000;
-                latencyMethod = 'capped-naive';
-            }
+            // =========================================================
+            // SCENARIO 3: Clock skew but not yet synced - estimate
+            // =========================================================
+            const avgRtt = this.rttSamples.length > 0 
+                ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+                : 20; // Default estimate
+            networkTime = avgRtt / 2;
+            latencyMethod = 'rtt-estimate';
             
             if (shouldLog) {
-                console.log(`Clock not synced, using ${latencyMethod} network latency: ${networkTime.toFixed(2)}ms`);
+                console.log(`Clock skew detected but sync incomplete - using RTT/2 estimate: ${networkTime.toFixed(1)}ms`);
             }
         }
+        
+        // ============================================================
+        // SANITY CHECKS
+        // ============================================================
+        
+        // Reject negative latency
+        if (networkTime < 0) {
+            if (shouldLog) {
+                console.warn(`Negative latency: ${networkTime.toFixed(1)}ms - using RTT/2 estimate`);
+            }
+            const avgRtt = this.rttSamples.length > 0 
+                ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+                : 20;
+            networkTime = avgRtt / 2;
+            latencyMethod = 'rtt-fallback';
+        }
+        
+        // Cap extremely high latency
+        const MAX_REASONABLE_LATENCY = 5000; // 5 seconds
+        if (networkTime > MAX_REASONABLE_LATENCY) {
+            if (shouldLog) {
+                console.warn(`Latency too high: ${networkTime.toFixed(1)}ms - capping at ${MAX_REASONABLE_LATENCY}ms`);
+            }
+            networkTime = MAX_REASONABLE_LATENCY;
+            latencyMethod = 'capped';
+        }
 
+        // ============================================================
+        // UPDATE METRICS
+        // ============================================================
         for (const [trackId, trackMetrics] of Object.entries(metricsData)) {
             const existing = this.metrics.get(trackId) || {};
             
@@ -671,11 +679,13 @@ class WebRTCClient {
                 ...existing,
                 rosLatency: trackMetrics.ros_latency || 0,
                 encodingLatency: trackMetrics.encoding_latency || 0,
-                networkLatency: Math.max(0, networkTime), // Ensure non-negative
+                networkLatency: Math.max(0, networkTime),
                 processingLatency: (trackMetrics.ros_latency || 0) + (trackMetrics.encoding_latency || 0),
                 timestamp: Date.now(),
                 clockSynced: this.clockSynced,
-                latencyMethod: latencyMethod
+                latencyMethod: latencyMethod,
+                rawLatency: rawLatency,
+                hasClockSkew: hasClockSkew
             };
 
             combined.totalLatency = 
@@ -685,7 +695,7 @@ class WebRTCClient {
                 (combined.renderLatency || 0);
 
             if (shouldLog) {
-                console.log('Metrics for', trackId, '- total:', combined.totalLatency.toFixed(1), 'ms');
+                console.log(`Metrics for ${trackId}: total=${combined.totalLatency.toFixed(1)}ms (method: ${latencyMethod})`);
             }
             this.metrics.set(trackId, combined);
         }
@@ -820,7 +830,7 @@ class WebRTCClient {
     }
 
     cleanup() {
-        console.log('🧹 Cleaning up...');
+        console.log('Cleaning up...');
         
         this.stopClockSync();
 
@@ -842,8 +852,13 @@ class WebRTCClient {
         this.streams.clear();
         this.metrics.clear();
         this.pendingPings.clear();
-        this.clockOffsetSamples = [];
+        
+        // Reset clock sync state
+        this.clockSyncSamples = [];
         this.rttSamples = [];
+        this.clockOffset = 0;
+        this.clockSynced = false;
+        this.lastSyncTime = null;
         
         this.videoElements.forEach(video => {
             video.srcObject = null;

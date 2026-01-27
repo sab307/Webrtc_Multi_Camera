@@ -4,6 +4,25 @@ let currentStreams = [];
 let currentStreamId = null;
 let metricsUpdateInterval = null;
 
+// ==================== LATENCY CHART ====================
+let latencyChart = null;
+const CHART_DURATION_SECONDS = 25;  // Show 25 seconds of data
+const CHART_UPDATE_INTERVAL = 100;  // Update every 100ms for smooth display
+
+// Latency history for graph (stores {time, total, ros, processing, network, render})
+let latencyHistory = [];
+const MAX_HISTORY_POINTS = CHART_DURATION_SECONDS * 10; // 10 points per second
+
+// Latency statistics
+let latencyStats = {
+    min: Infinity,
+    max: 0,
+    sum: 0,
+    count: 0,
+    current: 0,
+    method: '--'
+};
+
 // Initialize on page load
 document.addEventListener('DOMContentLoaded', async () => {
     console.log('Initializing ROS2 WebRTC Streaming with Clock Sync...');
@@ -207,19 +226,19 @@ function addStreamToGrid(trackId, stream) {
     video.srcObject = stream;
     
     video.onloadedmetadata = () => {
-        console.log(`Video ${trackId} metadata loaded:`, video.videoWidth, 'x', video.videoHeight);
+        console.log(`📺 Video ${trackId} metadata loaded:`, video.videoWidth, 'x', video.videoHeight);
     };
     
     video.onloadeddata = () => {
-        console.log(`Video ${trackId} data loaded`);
+        console.log(`📺 Video ${trackId} data loaded`);
     };
     
     video.onplay = () => {
-        console.log(`Video ${trackId} started playing`);
+        console.log(`📺 Video ${trackId} started playing`);
     };
     
     video.onerror = (e) => {
-        console.error(`Video ${trackId} error:`, e);
+        console.error(`📺 Video ${trackId} error:`, e);
     };
     
     const playVideo = async () => {
@@ -268,7 +287,7 @@ function addStreamToGrid(trackId, stream) {
     
     const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack) {
-        console.log('Video track state:', videoTrack.readyState, 'enabled:', videoTrack.enabled, 'muted:', videoTrack.muted);
+        console.log('📹 Video track state:', videoTrack.readyState, 'enabled:', videoTrack.enabled, 'muted:', videoTrack.muted);
         
         videoTrack.onended = () => {
             console.log(`Video track ${trackId} ended`);
@@ -349,15 +368,18 @@ function updateDetailMetrics(metrics) {
         document.getElementById('resolution').textContent = `${metrics.width}x${metrics.height}`;
     }
     
-    // Show clock sync status in metrics
+    // Show clock sync status and latency method
     const clockSyncStatus = document.getElementById('clockSyncStatus');
     if (clockSyncStatus) {
-        clockSyncStatus.textContent = metrics.clockSynced ? '✓ Synced' : '○ Not synced';
+        let statusText = metrics.clockSynced ? '✓ Synced' : '○ Syncing...';
+        if (metrics.latencyMethod) {
+            statusText += ` (${metrics.latencyMethod})`;
+        }
+        clockSyncStatus.textContent = statusText;
         clockSyncStatus.style.color = metrics.clockSynced ? '#48bb78' : '#ecc94b';
     }
 
-    const totalLatency = metrics.totalLatency || 1;
-    
+    // Update latency component values
     const rosLatency = metrics.rosLatency || 0;
     const processingLatency = metrics.processingLatency || 0;
     const networkLatency = metrics.networkLatency || 0;
@@ -367,11 +389,9 @@ function updateDetailMetrics(metrics) {
     document.getElementById('processingLatency').textContent = Math.round(processingLatency) + 'ms';
     document.getElementById('networkLatency').textContent = Math.round(networkLatency) + 'ms';
     document.getElementById('renderLatency').textContent = Math.round(renderLatency) + 'ms';
-
-    document.getElementById('rosLatencyBar').style.width = Math.min((rosLatency / totalLatency * 100), 100) + '%';
-    document.getElementById('processingLatencyBar').style.width = Math.min((processingLatency / totalLatency * 100), 100) + '%';
-    document.getElementById('networkLatencyBar').style.width = Math.min((networkLatency / totalLatency * 100), 100) + '%';
-    document.getElementById('renderLatencyBar').style.width = Math.min((renderLatency / totalLatency * 100), 100) + '%';
+    
+    // Update the latency chart
+    updateLatencyChart(metrics);
 }
 
 // ==================== DETAIL VIEW ====================
@@ -395,6 +415,13 @@ function showDetail(streamId) {
     video.srcObject = stream;
     video.play().catch(err => console.warn('Detail video play error:', err.message));
 
+    // Reset latency history and stats when showing detail
+    latencyHistory = [];
+    latencyStats = { min: Infinity, max: 0, sum: 0, count: 0, current: 0, method: '--' };
+    
+    // Initialize the latency chart
+    initLatencyChart();
+
     const metrics = webrtcClient.getMetrics(streamId);
     if (metrics) {
         updateDetailMetrics(metrics);
@@ -413,8 +440,230 @@ function showDashboard() {
     document.getElementById('dashboardView').style.display = 'block';
     document.getElementById('detailView').style.display = 'none';
 
+    // Destroy chart when leaving detail view
+    if (latencyChart) {
+        latencyChart.destroy();
+        latencyChart = null;
+    }
+
     const video = document.getElementById('detailVideo');
     video.srcObject = null;
+}
+
+// ==================== LATENCY CHART ====================
+
+function initLatencyChart() {
+    const ctx = document.getElementById('latencyChart');
+    if (!ctx) {
+        console.error('Latency chart canvas not found');
+        return;
+    }
+    
+    // Destroy existing chart if any
+    if (latencyChart) {
+        latencyChart.destroy();
+    }
+    
+    latencyChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Total Latency',
+                    data: [],
+                    borderColor: '#9C27B0',
+                    backgroundColor: 'rgba(156, 39, 176, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHitRadius: 10
+                },
+                {
+                    label: 'Network',
+                    data: [],
+                    borderColor: '#4facfe',
+                    backgroundColor: 'rgba(79, 172, 254, 0.1)',
+                    borderWidth: 1.5,
+                    fill: false,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    borderDash: [5, 5]
+                },
+                {
+                    label: 'ROS + Encoding',
+                    data: [],
+                    borderColor: '#43e97b',
+                    backgroundColor: 'rgba(67, 233, 123, 0.1)',
+                    borderWidth: 1.5,
+                    fill: false,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    borderDash: [2, 2]
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: {
+                duration: 0 // Disable animation for real-time feel
+            },
+            interaction: {
+                intersect: false,
+                mode: 'index'
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: {
+                        color: '#4a5568',
+                        usePointStyle: true,
+                        padding: 15,
+                        font: { size: 11 }
+                    }
+                },
+                tooltip: {
+                    enabled: true,
+                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                    titleColor: 'white',
+                    bodyColor: 'white',
+                    callbacks: {
+                        label: function(context) {
+                            return `${context.dataset.label}: ${context.parsed.y.toFixed(1)}ms`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    display: true,
+                    grid: { 
+                        color: 'rgba(0, 0, 0, 0.05)',
+                        drawBorder: false
+                    },
+                    ticks: { 
+                        color: '#718096',
+                        maxTicksLimit: 10,
+                        font: { size: 10 }
+                    },
+                    title: {
+                        display: true,
+                        text: 'Time',
+                        color: '#718096',
+                        font: { size: 11 }
+                    }
+                },
+                y: {
+                    display: true,
+                    grid: { 
+                        color: 'rgba(0, 0, 0, 0.05)',
+                        drawBorder: false
+                    },
+                    ticks: { 
+                        color: '#718096',
+                        font: { size: 10 },
+                        callback: function(value) {
+                            return value + 'ms';
+                        }
+                    },
+                    title: {
+                        display: true,
+                        text: 'Latency (ms)',
+                        color: '#718096',
+                        font: { size: 11 }
+                    },
+                    beginAtZero: true,
+                    suggestedMax: 150
+                }
+            }
+        }
+    });
+    
+    console.log('Latency chart initialized');
+}
+
+function updateLatencyChart(metrics) {
+    if (!latencyChart) return;
+    
+    const now = new Date();
+    const timeLabel = now.toLocaleTimeString('en-US', { 
+        hour12: false, 
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit' 
+    });
+    
+    const totalLatency = metrics.totalLatency || 0;
+    const networkLatency = metrics.networkLatency || 0;
+    const processingLatency = (metrics.rosLatency || 0) + (metrics.encodingLatency || 0);
+    
+    // Add to history
+    latencyHistory.push({
+        time: timeLabel,
+        total: totalLatency,
+        network: networkLatency,
+        processing: processingLatency,
+        timestamp: now.getTime()
+    });
+    
+    // Remove old entries (keep only last CHART_DURATION_SECONDS seconds)
+    const cutoffTime = now.getTime() - (CHART_DURATION_SECONDS * 1000);
+    while (latencyHistory.length > 0 && latencyHistory[0].timestamp < cutoffTime) {
+        latencyHistory.shift();
+    }
+    
+    // Also cap at MAX_HISTORY_POINTS
+    while (latencyHistory.length > MAX_HISTORY_POINTS) {
+        latencyHistory.shift();
+    }
+    
+    // Update chart data
+    latencyChart.data.labels = latencyHistory.map(h => h.time);
+    latencyChart.data.datasets[0].data = latencyHistory.map(h => h.total);
+    latencyChart.data.datasets[1].data = latencyHistory.map(h => h.network);
+    latencyChart.data.datasets[2].data = latencyHistory.map(h => h.processing);
+    
+    // Auto-scale Y axis based on data
+    const maxVal = Math.max(...latencyHistory.map(h => h.total), 50);
+    latencyChart.options.scales.y.suggestedMax = Math.ceil(maxVal * 1.2 / 10) * 10; // Round up to nearest 10
+    
+    latencyChart.update('none'); // 'none' mode for no animation
+    
+    // Update statistics
+    if (totalLatency > 0) {
+        latencyStats.current = totalLatency;
+        latencyStats.min = Math.min(latencyStats.min, totalLatency);
+        latencyStats.max = Math.max(latencyStats.max, totalLatency);
+        latencyStats.sum += totalLatency;
+        latencyStats.count++;
+        latencyStats.method = metrics.latencyMethod || '--';
+        
+        // Update stats display
+        updateLatencyStatsDisplay();
+    }
+}
+
+function updateLatencyStatsDisplay() {
+    const currentEl = document.getElementById('latencyCurrentValue');
+    const minEl = document.getElementById('latencyMinValue');
+    const avgEl = document.getElementById('latencyAvgValue');
+    const maxEl = document.getElementById('latencyMaxValue');
+    const methodEl = document.getElementById('latencyMethodValue');
+    
+    if (currentEl) currentEl.textContent = latencyStats.current.toFixed(1) + 'ms';
+    if (minEl) minEl.textContent = (latencyStats.min === Infinity ? '--' : latencyStats.min.toFixed(1) + 'ms');
+    if (avgEl && latencyStats.count > 0) {
+        avgEl.textContent = (latencyStats.sum / latencyStats.count).toFixed(1) + 'ms';
+    }
+    if (maxEl) maxEl.textContent = (latencyStats.max === 0 ? '--' : latencyStats.max.toFixed(1) + 'ms');
+    if (methodEl) {
+        methodEl.textContent = latencyStats.method;
+        // Color code by method
+        methodEl.className = 'value method-badge method-' + latencyStats.method;
+    }
 }
 
 // ==================== UTILITIES ====================
