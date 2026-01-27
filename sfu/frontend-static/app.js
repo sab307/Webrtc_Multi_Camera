@@ -91,7 +91,12 @@ function updateClockSyncDisplay(syncStats) {
     
     if (offsetValue) {
         const absOffset = Math.abs(syncStats.offset);
-        offsetValue.textContent = absOffset.toFixed(2) + 'ms';
+        // Show offset in seconds if > 1000ms
+        if (absOffset > 1000) {
+            offsetValue.textContent = (absOffset / 1000).toFixed(1) + 's';
+        } else {
+            offsetValue.textContent = absOffset.toFixed(2) + 'ms';
+        }
         
         // Color code based on offset magnitude
         if (absOffset < 10) {
@@ -104,11 +109,13 @@ function updateClockSyncDisplay(syncStats) {
     }
     
     if (offsetDirection) {
+        // Show offset source (Python or Go)
+        const source = syncStats.offsetSource || 'Go↔Browser';
         if (syncStats.offset > 0) {
-            offsetDirection.textContent = '(Server ahead)';
+            offsetDirection.textContent = `(Server ahead) [${source}]`;
             offsetDirection.className = 'offset-direction server-ahead';
         } else {
-            offsetDirection.textContent = '(Client ahead)';
+            offsetDirection.textContent = `(Client ahead) [${source}]`;
             offsetDirection.className = 'offset-direction client-ahead';
         }
     }
@@ -126,23 +133,28 @@ function updateClockSyncDisplay(syncStats) {
     }
     
     if (syncQualityEl) {
-        syncQualityEl.textContent = syncStats.syncQuality || 'Syncing...';
-        // Color code quality
-        const quality = syncStats.syncQuality || '';
-        if (quality === 'Excellent') {
-            syncQualityEl.style.color = '#48bb78';
-        } else if (quality === 'Good') {
-            syncQualityEl.style.color = '#68d391';
-        } else if (quality === 'Fair') {
-            syncQualityEl.style.color = '#ecc94b';
+        // Show Python calibrated status
+        if (syncStats.pythonCalibrated) {
+            syncQualityEl.textContent = 'Python Synced';
+            syncQualityEl.style.color = '#9f7aea'; // Purple for Python
         } else {
-            syncQualityEl.style.color = '#f56565';
+            syncQualityEl.textContent = syncStats.syncQuality || 'Syncing...';
+            const quality = syncStats.syncQuality || '';
+            if (quality === 'Excellent') {
+                syncQualityEl.style.color = '#48bb78';
+            } else if (quality === 'Good') {
+                syncQualityEl.style.color = '#68d391';
+            } else if (quality === 'Fair') {
+                syncQualityEl.style.color = '#ecc94b';
+            } else {
+                syncQualityEl.style.color = '#f56565';
+            }
         }
     }
     
     if (syncIndicator) {
         syncIndicator.className = 'sync-indicator synced';
-        syncIndicator.title = `Clock synchronized (${syncStats.syncQuality || 'Syncing'})`;
+        syncIndicator.title = `Clock synchronized (${syncStats.offsetSource || 'Go↔Browser'})`;
     }
     
     // Update detail view clock panel if visible
@@ -157,7 +169,26 @@ function updateDetailClockDisplay(syncStats) {
     const detailStdDev = document.getElementById('detailStdDev');
     
     if (detailOffset) {
-        detailOffset.textContent = syncStats.offset.toFixed(2) + 'ms';
+        const absOffset = Math.abs(syncStats.offset);
+        // Show offset in seconds if > 1000ms
+        let offsetText;
+        if (absOffset > 1000) {
+            offsetText = (absOffset / 1000).toFixed(1) + 's';
+        } else {
+            offsetText = absOffset.toFixed(2) + 'ms';
+        }
+        
+        const source = syncStats.offsetSource || 'Go↔Browser';
+        const direction = syncStats.offset > 0 ? 'Server ahead' : 'Client ahead';
+        detailOffset.textContent = `${offsetText} (${direction})`;
+        detailOffset.title = `Source: ${source}`;
+        
+        // Add Python indicator color if calibrated
+        if (syncStats.pythonCalibrated) {
+            detailOffset.style.color = '#9f7aea';
+        } else {
+            detailOffset.style.color = '';
+        }
     }
     if (detailRtt) {
         detailRtt.textContent = syncStats.avgRtt.toFixed(2) + 'ms';

@@ -515,6 +515,21 @@ body {
     color: #22543d;
 }
 
+.method-synced {
+    background: #bee3f8;
+    color: #2a4365;
+}
+
+.method-python-synced {
+    background: #e9d8fd;
+    color: #44337a;
+}
+
+.method-calibrating, .method-recalibrating {
+    background: #feebc8;
+    color: #744210;
+}
+
 .method-compensated {
     background: #feebc8;
     color: #744210;
@@ -526,8 +541,8 @@ body {
 }
 
 .method-capped {
-    background: #e9d8fd;
-    color: #44337a;
+    background: #fed7d7;
+    color: #742a2a;
 }
 
 .chart-container {
