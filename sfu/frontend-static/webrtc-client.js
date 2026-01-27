@@ -17,11 +17,8 @@ class WebRTCClient {
         this.pendingPings = new Map();  // pingId -> {t1}
         this.clockSyncInterval = null;
         this.clockOffset = 0;           // Server time - Client time (ms)
-        this.clockSynced = false;
+        this.clockSynced = false;       // True once we have reliable sync
         this.lastSyncTime = null;
-        
-        // Adaptive clock skew detection threshold
-        this.CLOCK_SKEW_THRESHOLD = 1000; // ms - if raw latency > this, apply compensation
         
         // Callbacks
         this.onStreamAdded = null;
@@ -49,7 +46,7 @@ class WebRTCClient {
      * The offset tells us: server_time = client_time + offset
      */
     startClockSync() {
-        console.log('Starting clock synchronization...');
+        console.log(' Starting clock synchronization...');
         
         // Send initial burst of pings for quick sync (5 pings, 200ms apart)
         for (let i = 0; i < 5; i++) {
@@ -91,7 +88,7 @@ class WebRTCClient {
         setTimeout(() => {
             if (this.pendingPings.has(pingId)) {
                 this.pendingPings.delete(pingId);
-                console.warn('Ping timeout:', pingId);
+                console.warn(' Ping timeout:', pingId);
             }
         }, 5000);
     }
@@ -101,7 +98,7 @@ class WebRTCClient {
         
         const pingData = this.pendingPings.get(msg.ping_id);
         if (!pingData) {
-            console.warn('Unknown pong received:', msg.ping_id);
+            console.warn(' Unknown pong received:', msg.ping_id);
             return;
         }
         
@@ -418,7 +415,7 @@ class WebRTCClient {
             
             const stream = event.streams[0];
             if (stream) {
-                console.log('Adding stream for track:', trackId);
+                console.log('🎬 Adding stream for track:', trackId);
                 this.streams.set(trackId, stream);
                 
                 this.metrics.set(trackId, {
@@ -582,96 +579,108 @@ class WebRTCClient {
     handleMetrics(metricsData, timestamp) {
         if (!this._metricsLogCount) this._metricsLogCount = 0;
         this._metricsLogCount++;
-        const shouldLog = this._metricsLogCount <= 3;
-        
-        if (shouldLog) {
-            console.log('handleMetrics called:', { metricsData, timestamp });
-        }
+        const shouldLog = this._metricsLogCount <= 5 || this._metricsLogCount % 30 === 0;
         
         const receiveTime = Date.now();
         const serverTimeMs = timestamp * 1000;
         
-        // ============================================================
-        // ADAPTIVE CLOCK SKEW DETECTION
-        // ============================================================
-        // Calculate raw latency (no compensation)
+        // Raw latency = client_receive_time - server_send_time (without any correction)
         const rawLatency = receiveTime - serverTimeMs;
-        
-        // Detect if clocks are significantly out of sync
-        // - If |rawLatency| > threshold: Clocks are skewed, apply compensation
-        // - If |rawLatency| < threshold: Clocks are synced, use raw value
-        const hasClockSkew = Math.abs(rawLatency) > this.CLOCK_SKEW_THRESHOLD;
         
         let networkTime;
         let latencyMethod;
         
-        if (hasClockSkew && this.clockSynced) {
-            // =========================================================
-            // SCENARIO 1: Clock skew detected - apply compensation
-            // =========================================================
-            const clientEquivalent = this.serverToClientTime(serverTimeMs);
-            networkTime = receiveTime - clientEquivalent;
-            latencyMethod = 'compensated';
+        // ============================================================
+        // CLOCK SYNC COMPENSATION
+        // ============================================================
+        // 
+        // clockOffset = server_time - client_time
+        //   - Positive offset: Server clock is ahead (server shows later time)
+        //   - Negative offset: Client clock is ahead (client shows later time)
+        //
+        // To find actual network latency:
+        //   1. Convert server timestamp to "what client clock would show at that instant"
+        //   2. Subtract from client's receive time
+        //
+        // FORMULA:
+        //   client_equivalent = server_time - offset
+        //                    = server_time - (server - client)
+        //                    = client_time_at_send
+        //
+        //   network_latency = receive_time - client_equivalent
+        //
+        // ALTERNATIVELY (clearer):
+        //   network_latency = raw_latency + offset
+        //   
+        //   - Client ahead (offset < 0): raw is too HIGH, we ADD negative offset → reduces it
+        //   - Server ahead (offset > 0): raw is too LOW/negative, we ADD positive offset → increases it
+        // ============================================================
+        
+        if (this.clockSynced) {
+            // Method 1: Direct formula (clearer)
+            // networkTime = rawLatency + this.clockOffset;
             
-            if (shouldLog || this._metricsLogCount % 60 === 0) {
-                console.log(`Clock skew detected! Raw=${rawLatency.toFixed(0)}ms`);
-                console.log(`Offset: ${this.clockOffset.toFixed(2)}ms`);
-                console.log(`Compensated latency: ${networkTime.toFixed(1)}ms`);
+            // Method 2: Via conversion (same result)
+            // clientEquivalent = serverTimeMs - offset
+            // networkTime = receiveTime - clientEquivalent = receiveTime - serverTimeMs + offset = rawLatency + offset
+            
+            // Using direct formula for clarity:
+            const compensatedLatency = rawLatency + this.clockOffset;
+            
+            if (shouldLog) {
+                console.log(`   Clock Sync Compensation:`);
+                console.log(`   Server timestamp: ${serverTimeMs.toFixed(0)}ms`);
+                console.log(`   Client receive:   ${receiveTime.toFixed(0)}ms`);
+                console.log(`   Raw latency:      ${rawLatency.toFixed(1)}ms`);
+                console.log(`   Clock offset:     ${this.clockOffset.toFixed(1)}ms (${this.clockOffset > 0 ? 'Server ahead' : 'Client ahead'})`);
+                console.log(`   Formula: ${rawLatency.toFixed(1)} + (${this.clockOffset.toFixed(1)}) = ${compensatedLatency.toFixed(1)}ms`);
             }
-        } else if (!hasClockSkew) {
-            // =========================================================
-            // SCENARIO 2: Clocks synced - use raw latency
-            // =========================================================
-            networkTime = rawLatency;
-            latencyMethod = 'raw';
             
-            if (shouldLog || this._metricsLogCount % 60 === 0) {
-                console.log(`Clocks synced! Latency=${networkTime.toFixed(1)}ms (no compensation needed)`);
+            // Sanity check the compensated latency
+            if (compensatedLatency >= 0 && compensatedLatency < 5000) {
+                networkTime = compensatedLatency;
+                latencyMethod = 'synced';
+            } else if (compensatedLatency < 0) {
+                // Negative = something wrong with sync, use RTT estimate
+                const avgRtt = this.rttSamples.length > 0 
+                    ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+                    : 20;
+                networkTime = avgRtt / 2;
+                latencyMethod = 'rtt-fallback';
+                
+                if (shouldLog) {
+                    console.warn(`Compensated latency negative (${compensatedLatency.toFixed(1)}ms) - using RTT/2: ${networkTime.toFixed(1)}ms`);
+                }
+            } else {
+                // Too high, cap it
+                networkTime = 5000;
+                latencyMethod = 'capped';
+                
+                if (shouldLog) {
+                    console.warn(`Compensated latency too high (${compensatedLatency.toFixed(1)}ms) - capped at 5000ms`);
+                }
             }
         } else {
-            // =========================================================
-            // SCENARIO 3: Clock skew but not yet synced - estimate
-            // =========================================================
-            const avgRtt = this.rttSamples.length > 0 
-                ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
-                : 20; // Default estimate
-            networkTime = avgRtt / 2;
-            latencyMethod = 'rtt-estimate';
+            // No clock sync yet - use raw or estimate
+            if (Math.abs(rawLatency) < 500) {
+                // Raw looks reasonable (same machine or synced clocks)
+                networkTime = Math.max(0, rawLatency);
+                latencyMethod = 'raw';
+            } else {
+                // Raw looks wrong - use RTT estimate
+                const avgRtt = this.rttSamples.length > 0 
+                    ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+                    : 20;
+                networkTime = avgRtt / 2;
+                latencyMethod = 'rtt-estimate';
+            }
             
             if (shouldLog) {
-                console.log(`Clock skew detected but sync incomplete - using RTT/2 estimate: ${networkTime.toFixed(1)}ms`);
+                console.log(`No clock sync - using ${latencyMethod}: ${networkTime.toFixed(1)}ms (raw: ${rawLatency.toFixed(1)}ms)`);
             }
-        }
-        
-        // ============================================================
-        // SANITY CHECKS
-        // ============================================================
-        
-        // Reject negative latency
-        if (networkTime < 0) {
-            if (shouldLog) {
-                console.warn(`Negative latency: ${networkTime.toFixed(1)}ms - using RTT/2 estimate`);
-            }
-            const avgRtt = this.rttSamples.length > 0 
-                ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
-                : 20;
-            networkTime = avgRtt / 2;
-            latencyMethod = 'rtt-fallback';
-        }
-        
-        // Cap extremely high latency
-        const MAX_REASONABLE_LATENCY = 5000; // 5 seconds
-        if (networkTime > MAX_REASONABLE_LATENCY) {
-            if (shouldLog) {
-                console.warn(`Latency too high: ${networkTime.toFixed(1)}ms - capping at ${MAX_REASONABLE_LATENCY}ms`);
-            }
-            networkTime = MAX_REASONABLE_LATENCY;
-            latencyMethod = 'capped';
         }
 
-        // ============================================================
-        // UPDATE METRICS
-        // ============================================================
+        // Update metrics for each track
         for (const [trackId, trackMetrics] of Object.entries(metricsData)) {
             const existing = this.metrics.get(trackId) || {};
             
@@ -685,7 +694,7 @@ class WebRTCClient {
                 clockSynced: this.clockSynced,
                 latencyMethod: latencyMethod,
                 rawLatency: rawLatency,
-                hasClockSkew: hasClockSkew
+                clockOffset: this.clockOffset
             };
 
             combined.totalLatency = 
@@ -695,7 +704,7 @@ class WebRTCClient {
                 (combined.renderLatency || 0);
 
             if (shouldLog) {
-                console.log(`Metrics for ${trackId}: total=${combined.totalLatency.toFixed(1)}ms (method: ${latencyMethod})`);
+                console.log(`${trackId}: total=${combined.totalLatency.toFixed(1)}ms, network=${combined.networkLatency.toFixed(1)}ms (${latencyMethod})`);
             }
             this.metrics.set(trackId, combined);
         }
