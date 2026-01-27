@@ -213,10 +213,10 @@ class WebRTCClient {
             // Log sync details
             if (this.clockSyncSamples.length <= 5 || this.clockSyncSamples.length % 5 === 0) {
                 console.log(`Clock Sync #${this.clockSyncSamples.length} [${syncQuality}]:`);
-                console.log(` Offset: ${this.clockOffset.toFixed(2)}ms (${syncStats.offsetDirection})`);
-                console.log(` RTT: ${rtt.toFixed(2)}ms (avg of best: ${avgRtt.toFixed(2)}ms)`);
-                console.log(` Using ${bestSamples.length}/${this.clockSyncSamples.length} best samples`);
-                console.log(` Std Dev: ${stdDev.toFixed(2)}ms`);
+                console.log(`Offset: ${this.clockOffset.toFixed(2)}ms (${syncStats.offsetDirection})`);
+                console.log(`RTT: ${rtt.toFixed(2)}ms (avg of best: ${avgRtt.toFixed(2)}ms)`);
+                console.log(`Using ${bestSamples.length}/${this.clockSyncSamples.length} best samples`);
+                console.log(`Std Dev: ${stdDev.toFixed(2)}ms`);
             }
             
             // Callback for UI updates
@@ -341,13 +341,16 @@ class WebRTCClient {
     }
 
     setupWebRTC() {
-        console.log('Setting up WebRTC...');
+        console.log('Setting up WebRTC with low-latency optimizations...');
 
         const configuration = {
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' }
-            ]
+            ],
+            // Optimize for low latency
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require'
         };
 
         this.pc = new RTCPeerConnection(configuration);
@@ -417,6 +420,20 @@ class WebRTCClient {
             console.log('Track kind:', event.track.kind);
             console.log('Streams:', event.streams);
             
+            // ==================== LOW LATENCY: Minimize jitter buffer ====================
+            const receiver = event.receiver;
+            if (receiver) {
+                if (receiver.playoutDelayHint !== undefined) {
+                    receiver.playoutDelayHint = 0.0;  // Request minimum delay
+                    console.log('Set playoutDelayHint to 0ms (minimum latency)');
+                }
+                if (receiver.jitterBufferTarget !== undefined) {
+                    receiver.jitterBufferTarget = 0.01;  // 10ms target
+                    console.log('Set jitterBufferTarget to 10ms');
+                }
+            }
+            // ============================================================================
+            
             let trackId = event.track.id;
             
             if (event.streams && event.streams.length > 0) {
@@ -431,7 +448,7 @@ class WebRTCClient {
             
             const stream = event.streams[0];
             if (stream) {
-                console.log('Adding stream for track:', trackId);
+                console.log(' Adding stream for track:', trackId);
                 this.streams.set(trackId, stream);
                 
                 this.metrics.set(trackId, {
@@ -440,7 +457,9 @@ class WebRTCClient {
                     rosLatency: 0,
                     processingLatency: 0,
                     networkLatency: 0,
-                    renderLatency: 0
+                    renderLatency: 0,
+                    jitterBufferDelay: 0,
+                    decodeTime: 0
                 });
                 
                 try {
@@ -556,27 +575,61 @@ class WebRTCClient {
         video.playsInline = true;
         video.autoplay = true;
         
+        // Low latency video element hints
+        video.preload = 'none';
+        if (video.latencyHint !== undefined) {
+            video.latencyHint = 'low';
+        }
+        
         video.play().catch(e => {
             console.warn('Video play error (hidden element):', e.message);
         });
 
-        let lastFrameTime = performance.now();
+        let lastPresentationTime = 0;
         let frameCount = 0;
+        let processingDurationSamples = [];
 
         const callback = (now, metadata) => {
             frameCount++;
-            const timeSinceLastFrame = now - lastFrameTime;
-            lastFrameTime = now;
-
             const metrics = this.metrics.get(trackId) || {};
-            metrics.renderLatency = timeSinceLastFrame;
             metrics.frameCount = frameCount;
             
             if (metadata) {
                 metrics.presentedFrames = metadata.presentedFrames;
                 metrics.width = metadata.width;
                 metrics.height = metadata.height;
+                
+                // ==================== PROPER RENDER LATENCY ====================
+                // Use processingDuration if available (Chrome 89+)
+                // This is the actual time spent decoding + rendering the frame
+                if (metadata.processingDuration !== undefined) {
+                    const processingMs = metadata.processingDuration * 1000;
+                    processingDurationSamples.push(processingMs);
+                    if (processingDurationSamples.length > 30) {
+                        processingDurationSamples.shift();
+                    }
+                    // Use median for stability
+                    const sorted = [...processingDurationSamples].sort((a, b) => a - b);
+                    metrics.renderLatency = sorted[Math.floor(sorted.length / 2)];
+                }
+                
+                // Frame interval (for FPS calculation)
+                if (lastPresentationTime > 0 && metadata.presentationTime) {
+                    metrics.frameInterval = (metadata.presentationTime - lastPresentationTime) * 1000;
+                }
+                if (metadata.presentationTime) {
+                    lastPresentationTime = metadata.presentationTime;
+                }
+                
+                // Expected vs actual display time (compositor delay)
+                if (metadata.expectedDisplayTime && metadata.presentationTime) {
+                    metrics.compositorDelay = (metadata.presentationTime - metadata.expectedDisplayTime) * 1000;
+                }
+            } else {
+                // Fallback: use frame interval as rough estimate
+                metrics.renderLatency = now - (this._lastFrameTime || now);
             }
+            this._lastFrameTime = now;
 
             this.metrics.set(trackId, metrics);
 
@@ -587,9 +640,68 @@ class WebRTCClient {
 
         if (video.requestVideoFrameCallback) {
             video.requestVideoFrameCallback(callback);
+            console.log(' requestVideoFrameCallback enabled for', trackId);
+        } else {
+            console.warn(' requestVideoFrameCallback not supported - render latency will be estimated');
         }
 
         this.videoElements.set(trackId, video);
+        
+        // Start jitter buffer monitoring
+        this.startJitterBufferMonitoring(trackId);
+    }
+    
+    // Monitor jitter buffer stats periodically
+    startJitterBufferMonitoring(trackId) {
+        if (this._jitterMonitorInterval) return; // Already monitoring
+        
+        this._jitterMonitorInterval = setInterval(async () => {
+            if (!this.pc) return;
+            
+            try {
+                const stats = await this.pc.getStats();
+                
+                stats.forEach(report => {
+                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                        const metrics = this.metrics.get(trackId) || {};
+                        
+                        // Jitter buffer delay
+                        if (report.jitterBufferDelay && report.jitterBufferEmittedCount) {
+                            metrics.jitterBufferDelay = (report.jitterBufferDelay / report.jitterBufferEmittedCount) * 1000;
+                        }
+                        
+                        // Decode time per frame
+                        if (report.totalDecodeTime && report.framesDecoded) {
+                            metrics.decodeTime = (report.totalDecodeTime / report.framesDecoded) * 1000;
+                        }
+                        
+                        // Frames dropped
+                        metrics.framesDropped = report.framesDropped || 0;
+                        metrics.framesDecoded = report.framesDecoded || 0;
+                        
+                        // Jitter
+                        if (report.jitter !== undefined) {
+                            metrics.jitter = report.jitter * 1000;
+                        }
+                        
+                        this.metrics.set(trackId, metrics);
+                        
+                        // Log occasionally
+                        if (this._jitterLogCount === undefined) this._jitterLogCount = 0;
+                        this._jitterLogCount++;
+                        if (this._jitterLogCount <= 3 || this._jitterLogCount % 30 === 0) {
+                            console.log(`Render Pipeline Stats:`);
+                            console.log(`Jitter Buffer: ${metrics.jitterBufferDelay?.toFixed(1) || '?'}ms`);
+                            console.log(`Decode Time: ${metrics.decodeTime?.toFixed(1) || '?'}ms`);
+                            console.log(`Render (processing): ${metrics.renderLatency?.toFixed(1) || '?'}ms`);
+                            console.log(`Frames: ${metrics.framesDecoded} decoded, ${metrics.framesDropped} dropped`);
+                        }
+                    }
+                });
+            } catch (e) {
+                // Ignore stats errors
+            }
+        }, 1000);
     }
 
     handleMetrics(metricsData, timestamp) {
@@ -657,10 +769,10 @@ class WebRTCClient {
                 this.pythonBrowserOffset = medianRaw - estimatedNetworkLatency;
                 this.pythonOffsetCalibrated = true;
                 
-                console.log(`Python↔Browser clock skew detected and calibrated:`);
-                console.log(`Median raw latency: ${medianRaw.toFixed(1)}ms`);
-                console.log(`Estimated network: ${estimatedNetworkLatency.toFixed(1)}ms`);
-                console.log(`Python offset: ${this.pythonBrowserOffset.toFixed(1)}ms (${(this.pythonBrowserOffset/1000).toFixed(1)}s)`);
+                console.log(` Python↔Browser clock skew detected and calibrated:`);
+                console.log(` Median raw latency: ${medianRaw.toFixed(1)}ms`);
+                console.log(` Estimated network: ${estimatedNetworkLatency.toFixed(1)}ms`);
+                console.log(` Python offset: ${this.pythonBrowserOffset.toFixed(1)}ms (${(this.pythonBrowserOffset/1000).toFixed(1)}s)`);
             }
             
             // Apply Python offset if calibrated
@@ -728,9 +840,9 @@ class WebRTCClient {
                 const compensatedLatency = rawLatency + this.clockOffset;
                 
                 if (shouldLog) {
-                    console.log(` Standard Compensation (Go↔Browser):`);
-                    console.log(` Raw: ${rawLatency.toFixed(1)}ms, Offset: ${this.clockOffset.toFixed(1)}ms`);
-                    console.log(` Compensated: ${compensatedLatency.toFixed(1)}ms`);
+                    console.log(`Standard Compensation (Go↔Browser):`);
+                    console.log(`Raw: ${rawLatency.toFixed(1)}ms, Offset: ${this.clockOffset.toFixed(1)}ms`);
+                    console.log(`Compensated: ${compensatedLatency.toFixed(1)}ms`);
                 }
                 
                 if (compensatedLatency >= 0 && compensatedLatency < 1000) {
@@ -912,9 +1024,15 @@ class WebRTCClient {
     }
 
     cleanup() {
-        console.log('🧹 Cleaning up...');
+        console.log('Cleaning up...');
         
         this.stopClockSync();
+        
+        // Stop jitter buffer monitoring
+        if (this._jitterMonitorInterval) {
+            clearInterval(this._jitterMonitorInterval);
+            this._jitterMonitorInterval = null;
+        }
 
         if (this.dataChannel) {
             this.dataChannel.close();

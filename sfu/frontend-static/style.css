@@ -570,7 +570,7 @@ body {
 
 .latency-components-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     gap: 15px;
 }
 
@@ -612,6 +612,14 @@ body {
     background: linear-gradient(135deg, #4facfe15 0%, #00f2fe15 100%);
 }
 
+.component-icon.jitter {
+    background: linear-gradient(135deg, #ffecd215 0%, #fcb69f15 100%);
+}
+
+.component-icon.decode {
+    background: linear-gradient(135deg, #a8edea15 0%, #fed6e315 100%);
+}
+
 .component-icon.render {
     background: linear-gradient(135deg, #43e97b15 0%, #38f9d715 100%);
 }
@@ -650,6 +658,12 @@ body {
 }
 
 /* Responsive Design */
+@media (max-width: 1200px) {
+    .latency-components-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+}
+
 @media (max-width: 1024px) {
     .clock-sync-grid {
         grid-template-columns: repeat(3, 1fr);
@@ -660,7 +674,7 @@ body {
     }
     
     .latency-components-grid {
-        grid-template-columns: repeat(2, 1fr);
+        grid-template-columns: repeat(3, 1fr);
     }
 }
 
@@ -705,7 +719,7 @@ body {
     }
     
     .latency-components-grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, 1fr);
     }
     
     .latency-stats-bar {

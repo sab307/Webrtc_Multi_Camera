@@ -414,11 +414,41 @@ function updateDetailMetrics(metrics) {
     const rosLatency = metrics.rosLatency || 0;
     const processingLatency = metrics.processingLatency || 0;
     const networkLatency = metrics.networkLatency || 0;
+    const jitterBufferDelay = metrics.jitterBufferDelay || 0;
+    const decodeTime = metrics.decodeTime || 0;
     const renderLatency = metrics.renderLatency || 0;
 
     document.getElementById('rosLatency').textContent = Math.round(rosLatency) + 'ms';
     document.getElementById('processingLatency').textContent = Math.round(processingLatency) + 'ms';
     document.getElementById('networkLatency').textContent = Math.round(networkLatency) + 'ms';
+    
+    // New metrics
+    const jitterEl = document.getElementById('jitterBufferLatency');
+    if (jitterEl) {
+        jitterEl.textContent = jitterBufferDelay.toFixed(1) + 'ms';
+        // Color code: green < 20ms, yellow < 50ms, red > 50ms
+        if (jitterBufferDelay < 20) {
+            jitterEl.style.color = '#48bb78';
+        } else if (jitterBufferDelay < 50) {
+            jitterEl.style.color = '#ecc94b';
+        } else {
+            jitterEl.style.color = '#f56565';
+        }
+    }
+    
+    const decodeEl = document.getElementById('decodeLatency');
+    if (decodeEl) {
+        decodeEl.textContent = decodeTime.toFixed(1) + 'ms';
+        // Color code: green < 10ms, yellow < 20ms, red > 20ms
+        if (decodeTime < 10) {
+            decodeEl.style.color = '#48bb78';
+        } else if (decodeTime < 20) {
+            decodeEl.style.color = '#ecc94b';
+        } else {
+            decodeEl.style.color = '#f56565';
+        }
+    }
+    
     document.getElementById('renderLatency').textContent = Math.round(renderLatency) + 'ms';
     
     // Update the latency chart

@@ -36,7 +36,7 @@
             <div class="container">
                 <!-- Clock Sync Panel -->
                 <div class="clock-sync-panel">
-                    <h3>Clock Synchronization</h3>
+                    <h3>⏱️ Clock Synchronization</h3>
                     <div class="clock-sync-grid">
                         <div class="clock-stat">
                             <span class="clock-stat-label">Clock Offset</span>
@@ -116,7 +116,7 @@
 
                     <!-- Latency Graph Section -->
                     <div class="latency-graph-section">
-                        <h3>Latency Over Time (Last 20+ seconds)</h3>
+                        <h3>📊 Latency Over Time (Last 20+ seconds)</h3>
                         <div class="latency-stats-bar">
                             <div class="latency-stat-item">
                                 <span class="label">Current:</span>
@@ -170,9 +170,23 @@
                                 </div>
                             </div>
                             <div class="latency-component">
+                                <div class="component-icon jitter">📦</div>
+                                <div class="component-info">
+                                    <span class="component-name">Jitter Buffer</span>
+                                    <span class="component-value" id="jitterBufferLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
+                                <div class="component-icon decode">🔓</div>
+                                <div class="component-info">
+                                    <span class="component-name">Decode</span>
+                                    <span class="component-value" id="decodeLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
                                 <div class="component-icon render">🖥️</div>
                                 <div class="component-info">
-                                    <span class="component-name">Rendering</span>
+                                    <span class="component-name">Render</span>
                                     <span class="component-value" id="renderLatency">0ms</span>
                                 </div>
                             </div>
@@ -181,7 +195,7 @@
 
                     <!-- Clock Sync Detail Panel -->
                     <div class="clock-section">
-                        <h3>Clock Synchronization Details</h3>
+                        <h3>⏱️ Clock Synchronization Details</h3>
                         <div class="clock-detail-grid">
                             <div class="clock-detail-item">
                                 <span class="label">Clock Offset</span>
