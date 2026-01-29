@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ROS2 WebRTC Streaming</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <h1>🎥 ROS2 WebRTC Streaming</h1>
+            <div class="header-right">
+                <!-- Clock Sync Status (compact) -->
+                <div class="clock-sync-compact">
+                    <div class="sync-indicator" id="clockSyncIndicator" title="Clock not synchronized"></div>
+                    <span class="sync-label">Clock:</span>
+                    <span class="sync-value" id="clockOffset">--</span>
+                    <span class="offset-direction" id="offsetDirection"></span>
+                </div>
+                
+                <div class="connection-status">
+                    <div class="status-indicator" id="statusIndicator"></div>
+                    <span id="statusText">Disconnected</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main" id="mainContent">
+        <!-- Dashboard View (Grid) -->
+        <div id="dashboardView" class="dashboard-view">
+            <div class="container">
+                <!-- Clock Sync Panel -->
+                <div class="clock-sync-panel">
+                    <h3>⏱️ Clock Synchronization</h3>
+                    <div class="clock-sync-grid">
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Clock Offset</span>
+                            <span class="clock-stat-value" id="clockOffset">--</span>
+                            <span class="clock-stat-desc">Difference between server and client clocks</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">RTT (Avg)</span>
+                            <span class="clock-stat-value" id="clockRtt">--</span>
+                            <span class="clock-stat-desc">Round-trip time to server</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Jitter</span>
+                            <span class="clock-stat-value" id="clockJitter">--</span>
+                            <span class="clock-stat-desc">RTT variation (max - min)</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Samples</span>
+                            <span class="clock-stat-value" id="clockSamples">0</span>
+                            <span class="clock-stat-desc">Accepted sync measurements</span>
+                        </div>
+                        <div class="clock-stat">
+                            <span class="clock-stat-label">Quality</span>
+                            <span class="clock-stat-value" id="syncQuality">--</span>
+                            <span class="clock-stat-desc">Sync stability rating</span>
+                        </div>
+                    </div>
+                    <p class="clock-sync-explanation">
+                        <strong>How it works:</strong> NTP-style ping/pong measures 4 timestamps (t1→t2→t3→t4) to calculate 
+                        <code>offset = ((t2-t1) + (t3-t4)) / 2</code>. Outliers (RTT &gt; 500ms) are rejected. Best 50% of samples used.
+                    </p>
+                </div>
+
+                <h2>Live Camera Streams</h2>
+                <div id="streamGrid" class="stream-grid">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        <p>Waiting for streams...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Detail View (Single Stream) -->
+        <div id="detailView" class="detail-view" style="display: none;">
+            <div class="container">
+                <button class="back-button" onclick="showDashboard()">← Back to Grid</button>
+                
+                <div class="detail-content">
+                    <div class="video-section">
+                        <div class="video-wrapper">
+                            <video id="detailVideo" class="detail-video" autoplay playsinline muted></video>
+                            <div class="video-overlay">
+                                <span class="live-indicator">● LIVE</span>
+                                <span class="clock-sync-badge" id="clockSyncStatus">○ Syncing...</span>
+                            </div>
+                        </div>
+                        
+                        <div class="stream-info">
+                            <h2 id="streamTitle">Stream Name</h2>
+                            <div class="stats-row">
+                                <div class="stat">
+                                    <span class="stat-label">Total Latency</span>
+                                    <span class="stat-value" id="totalLatency">0ms</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Frame Count</span>
+                                    <span class="stat-value" id="frameCount">0</span>
+                                </div>
+                                <div class="stat">
+                                    <span class="stat-label">Resolution</span>
+                                    <span class="stat-value" id="resolution">N/A</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Latency Graph Section -->
+                    <div class="latency-graph-section">
+                        <h3>📊 Latency Over Time (Last 20+ seconds)</h3>
+                        <div class="latency-stats-bar">
+                            <div class="latency-stat-item">
+                                <span class="label">Current:</span>
+                                <span class="value" id="latencyCurrentValue">--</span>
+                            </div>
+                            <div class="latency-stat-item">
+                                <span class="label">Min:</span>
+                                <span class="value" id="latencyMinValue">--</span>
+                            </div>
+                            <div class="latency-stat-item">
+                                <span class="label">Avg:</span>
+                                <span class="value" id="latencyAvgValue">--</span>
+                            </div>
+                            <div class="latency-stat-item">
+                                <span class="label">Max:</span>
+                                <span class="value" id="latencyMaxValue">--</span>
+                            </div>
+                            <div class="latency-stat-item">
+                                <span class="label">Method:</span>
+                                <span class="value method-badge" id="latencyMethodValue">--</span>
+                            </div>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="latencyChart"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Latency Breakdown (Compact) -->
+                    <div class="latency-breakdown-section">
+                        <h3>Latency Components</h3>
+                        <div class="latency-components-grid">
+                            <div class="latency-component">
+                                <div class="component-icon ros">📷</div>
+                                <div class="component-info">
+                                    <span class="component-name">ROS2 Capture</span>
+                                    <span class="component-value" id="rosLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
+                                <div class="component-icon processing">⚙️</div>
+                                <div class="component-info">
+                                    <span class="component-name">Encoding</span>
+                                    <span class="component-value" id="processingLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
+                                <div class="component-icon network">🌐</div>
+                                <div class="component-info">
+                                    <span class="component-name">Network</span>
+                                    <span class="component-value" id="networkLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
+                                <div class="component-icon jitter">📦</div>
+                                <div class="component-info">
+                                    <span class="component-name">Jitter Buffer</span>
+                                    <span class="component-value" id="jitterBufferLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
+                                <div class="component-icon decode">🔓</div>
+                                <div class="component-info">
+                                    <span class="component-name">Decode</span>
+                                    <span class="component-value" id="decodeLatency">0ms</span>
+                                </div>
+                            </div>
+                            <div class="latency-component">
+                                <div class="component-icon render">🖥️</div>
+                                <div class="component-info">
+                                    <span class="component-name">Render</span>
+                                    <span class="component-value" id="renderLatency">0ms</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Clock Sync Detail Panel -->
+                    <div class="clock-section">
+                        <h3>⏱️ Clock Synchronization Details</h3>
+                        <div class="clock-detail-grid">
+                            <div class="clock-detail-item">
+                                <span class="label">Clock Offset</span>
+                                <span class="value" id="detailClockOffset">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Avg RTT</span>
+                                <span class="value" id="detailClockRtt">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Min RTT</span>
+                                <span class="value" id="detailMinRtt">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Max RTT</span>
+                                <span class="value" id="detailMaxRtt">--</span>
+                            </div>
+                            <div class="clock-detail-item">
+                                <span class="label">Std Dev</span>
+                                <span class="value" id="detailStdDev">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <p>ROS2 WebRTC Streaming System • <span id="streamCount">0</span> active streams • Clock sync enabled</p>
+        </div>
+    </footer>
+
+    <script src="webrtc-client.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
