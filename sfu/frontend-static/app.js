@@ -278,7 +278,7 @@ function addStreamToGrid(trackId, stream) {
             console.log(`Video ${trackId} playing`);
         } catch (err) {
             console.warn(`Video ${trackId} play failed:`, err.message);
-            setTimeout(playVideo, 500);
+            setTimeout(playVideo, 500); 
         }
     };
     
