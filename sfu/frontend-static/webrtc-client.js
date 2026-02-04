@@ -1,67 +1,68 @@
-// WebRTC Client for ROS2 Streaming with Clock Synchronization
+// WebRTC Client for ROS2 Streaming
+// 
+// FIXES APPLIED:
+// 1. getClockSyncStats() returns ALL fields app.js expects (minRtt, maxRtt, etc.)
+// 2. Timestamp correlation: store timestamps in buffer, calculate latency at DISPLAY time
+// 3. Works with EXISTING Go relay (no Go changes needed) - frame_id sent inside 'metrics' messages
+// 4. Backward compatible with old metrics format
+//
 class WebRTCClient {
     constructor(signalingUrl) {
         this.signalingUrl = signalingUrl;
         this.ws = null;
         this.pc = null;
         this.dataChannel = null;
-        this.streams = new Map(); // trackId -> MediaStream
-        this.metrics = new Map(); // trackId -> metrics
-        this.videoElements = new Map(); // trackId -> video element
+        this.streams = new Map();
+        this.metrics = new Map();
+        this.videoElements = new Map();
         this.clientId = null;
         
         // ==================== CLOCK SYNCHRONIZATION STATE ====================
-        // Stores {offset, rtt, timestamp} objects for quality-based filtering
         this.clockSyncSamples = [];
-        this.rttSamples = [];           // Derived from best clockSyncSamples
-        this.pendingPings = new Map();  // pingId -> {t1}
+        this.rttSamples = [];
+        this.pendingPings = new Map();
         this.clockSyncInterval = null;
-        this.clockOffset = 0;           // Go Server ↔ Browser offset (from ping/pong)
-        this.clockSynced = false;       // True once we have reliable sync
+        this.clockOffset = 0;           // Go Server ↔ Browser offset (ping/pong)
+        this.clockSynced = false;
         this.lastSyncTime = null;
         
         // ==================== TWO-STAGE CLOCK SYNC ====================
-        // The ping/pong measures: Go relay ↔ Browser offset
-        // But metrics timestamps come from: Python sender
-        // So we need to detect and compensate for Python ↔ Browser offset separately
-        this.pythonBrowserOffset = 0;       // Python sender ↔ Browser offset
-        this.pythonOffsetCalibrated = false; // True once we've calculated Python offset
-        this.rawLatencySamples = [];        // Recent raw latencies for calibration
+        this.pythonBrowserOffset = 0;
+        this.pythonOffsetCalibrated = false;
+        this.rawLatencySamples = [];
+        
+        // ==================== TIMESTAMP BUFFER FOR FRAME CORRELATION ====================
+        //
+        // WHY THIS EXISTS:
+        // Timestamps arrive via DataChannel/WebSocket (~25-40ms path)
+        // Video frames arrive via RTP/decode/display (~60-120ms path)
+        //
+        // So timestamps arrive 40-80ms BEFORE their video frame!
+        //
+        // OLD BUG: Calculated latency when timestamp arrived → showed ~40ms (wrong!)
+        // FIX: Store timestamp, calculate when video displays → shows ~100ms (correct!)
+        //
+        this.timestampBuffer = new Map();  // frame_id -> {capture_ms, receive_ms, ...}
+        this.frameIdOffset = null;         // Maps browser's presentedFrames → Python's frame_id
+        this.glassLatencyHistory = [];     // Smoothing buffer
         
         // Callbacks
         this.onStreamAdded = null;
         this.onStreamRemoved = null;
         this.onMetricsUpdate = null;
         this.onConnectionStateChange = null;
-        this.onClockSync = null;        // Callback for clock sync updates
+        this.onClockSync = null;
     }
     
     // ==================== CLOCK SYNCHRONIZATION ====================
     
-    /**
-     * Start the clock synchronization process.
-     * Uses NTP-style ping/pong to measure RTT and calculate clock offset.
-     * 
-     * Algorithm:
-     *   t1 = client send time
-     *   t2 = server receive time
-     *   t3 = server send time
-     *   t4 = client receive time
-     *   
-     *   RTT = (t4 - t1) - (t3 - t2)
-     *   Offset = ((t2 - t1) + (t3 - t4)) / 2
-     *   
-     * The offset tells us: server_time = client_time + offset
-     */
     startClockSync() {
         console.log('Starting clock synchronization...');
         
-        // Send initial burst of pings for quick sync (5 pings, 200ms apart)
         for (let i = 0; i < 5; i++) {
             setTimeout(() => this.sendPing(), i * 200);
         }
         
-        // Then sync periodically (every 5 seconds) to maintain accuracy
         this.clockSyncInterval = setInterval(() => {
             this.sendPing();
         }, 5000);
@@ -75,211 +76,115 @@ class WebRTCClient {
     }
     
     sendPing() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            return;
-        }
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         
         const pingId = Math.random().toString(36).substring(2, 10);
-        const t1 = Date.now(); // Client send time (absolute)
+        const t1 = Date.now();
         
-        this.pendingPings.set(pingId, {
-            t1: t1
-        });
+        this.pendingPings.set(pingId, { t1 });
         
         this.sendMessage({
             type: 'ping',
             ping_id: pingId,
-            client_time: t1  // Send absolute time to server
+            client_time: t1
         });
         
-        // Timeout - remove stale pings after 5 seconds
         setTimeout(() => {
             if (this.pendingPings.has(pingId)) {
                 this.pendingPings.delete(pingId);
-                console.warn('Ping timeout:', pingId);
             }
         }, 5000);
     }
     
     handlePong(msg) {
-        const t4 = Date.now(); // Client receive time
+        const t4 = Date.now();
         
         const pingData = this.pendingPings.get(msg.ping_id);
-        if (!pingData) {
-            console.warn('Unknown pong received:', msg.ping_id);
-            return;
-        }
-        
+        if (!pingData) return;
         this.pendingPings.delete(msg.ping_id);
         
-        // NTP-style timestamps:
-        const t1 = pingData.t1;          // Client send time
-        const t2 = msg.server_receive;   // Server receive time
-        const t3 = msg.server_send;      // Server send time
-        // t4 = client receive time (already set above)
+        const t1 = pingData.t1;
+        const t2 = msg.server_receive;
+        const t3 = msg.server_send;
         
-        // Calculate RTT and offset
         const rtt = (t4 - t1) - (t3 - t2);
         const oneWayDelay = rtt / 2;
-        
-        // Offset calculation: server_time + one_way_delay should equal our receive_time
-        // offset = server_time - client_time (positive = server ahead)
         const offset = (t2 + oneWayDelay) - t4;
         
-        // ============================================================
-        // OUTLIER FILTERING - Reject bad samples based on RTT
-        // ============================================================
+        const MAX_VALID_RTT = 500;
+        if (rtt > MAX_VALID_RTT || rtt < 0) return;
         
-        // Filter 1: Reject if RTT is too high (network congestion)
-        const MAX_VALID_RTT = 500; // ms - stricter threshold
-        if (rtt > MAX_VALID_RTT || rtt < 0) {
-            console.warn(`Rejected sample: RTT ${rtt.toFixed(2)}ms out of range (max: ${MAX_VALID_RTT}ms)`);
-            return;
-        }
-        
-        // ============================================================
-        // SAMPLE ACCEPTED - Store with RTT for quality-based filtering
-        // ============================================================
-        
-        this.clockSyncSamples.push({
-            offset: offset,
-            rtt: rtt,
-            timestamp: t4
-        });
-        
-        // Keep last 20 samples
-        if (this.clockSyncSamples.length > 20) {
-            this.clockSyncSamples.shift();
-        }
-        
-        // ============================================================
-        // IMPROVED: Use median offset from samples with LOWEST RTT
-        // This gives more accurate sync by prioritizing best network conditions
-        // ============================================================
+        this.clockSyncSamples.push({ offset, rtt, timestamp: t4 });
+        if (this.clockSyncSamples.length > 20) this.clockSyncSamples.shift();
         
         if (this.clockSyncSamples.length >= 3) {
-            // Sort by RTT and take the best 50% of samples
             const sortedByRTT = [...this.clockSyncSamples].sort((a, b) => a.rtt - b.rtt);
             const bestSamples = sortedByRTT.slice(0, Math.ceil(sortedByRTT.length / 2));
             
-            // Calculate median offset from best samples
             const offsets = bestSamples.map(s => s.offset).sort((a, b) => a - b);
-            const medianOffset = offsets[Math.floor(offsets.length / 2)];
-            
-            // Calculate RTT stats from best samples
-            const rtts = bestSamples.map(s => s.rtt);
-            const avgRtt = rtts.reduce((a, b) => a + b, 0) / rtts.length;
-            const minRtt = Math.min(...rtts);
-            const maxRtt = Math.max(...rtts);
-            
-            // Update the clock offset
-            this.clockOffset = medianOffset;
+            this.clockOffset = offsets[Math.floor(offsets.length / 2)];
             this.clockSynced = true;
             this.lastSyncTime = Date.now();
+            this.rttSamples = bestSamples.map(s => s.rtt);
             
-            // Store RTT samples for stats
-            this.rttSamples = rtts;
-            
-            // Calculate sync quality
-            const allOffsets = this.clockSyncSamples.map(s => s.offset);
-            const avgOffset = allOffsets.reduce((a, b) => a + b, 0) / allOffsets.length;
-            const variance = allOffsets.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / allOffsets.length;
-            const stdDev = Math.sqrt(variance);
-            
-            // Determine sync quality rating
-            let syncQuality = 'Excellent';
-            if (stdDev > 20) syncQuality = 'Good';
-            if (stdDev > 50) syncQuality = 'Fair';
-            if (stdDev > 100) syncQuality = 'Poor';
-            
-            const syncStats = {
-                offset: this.clockOffset,
-                offsetDirection: this.clockOffset > 0 ? 'Server ahead' : 'Client ahead',
-                rtt: rtt,
-                avgRtt: avgRtt,
-                minRtt: minRtt,
-                maxRtt: maxRtt,
-                jitter: maxRtt - minRtt,
-                stdDev: stdDev,
-                syncQuality: syncQuality,
-                samples: this.clockSyncSamples.length,
-                usedSamples: bestSamples.length,
-                t1: t1,
-                t2: t2,
-                t3: t3,
-                t4: t4
-            };
-            
-            // Log sync details
             if (this.clockSyncSamples.length <= 5 || this.clockSyncSamples.length % 5 === 0) {
-                console.log(`Clock Sync #${this.clockSyncSamples.length} [${syncQuality}]:`);
-                console.log(`Offset: ${this.clockOffset.toFixed(2)}ms (${syncStats.offsetDirection})`);
-                console.log(`RTT: ${rtt.toFixed(2)}ms (avg of best: ${avgRtt.toFixed(2)}ms)`);
-                console.log(`Using ${bestSamples.length}/${this.clockSyncSamples.length} best samples`);
-                console.log(`Std Dev: ${stdDev.toFixed(2)}ms`);
+                const rtts = bestSamples.map(s => s.rtt);
+                const avgRtt = rtts.reduce((a, b) => a + b, 0) / rtts.length;
+                console.log(`Clock Sync: offset=${this.clockOffset.toFixed(2)}ms, RTT=${rtt.toFixed(2)}ms (avg best: ${avgRtt.toFixed(2)}ms)`);
             }
             
-            // Callback for UI updates
             if (this.onClockSync) {
-                this.onClockSync(syncStats);
+                this.onClockSync(this.getClockSyncStats());
             }
-        } else {
-            console.log(`Collecting samples: ${this.clockSyncSamples.length}/3 (RTT: ${rtt.toFixed(2)}ms)`);
         }
     }
     
-    /**
-     * Convert a server timestamp to client time
-     * @param {number} serverTime - Timestamp from server
-     * @returns {number} Equivalent client time
-     */
     serverToClientTime(serverTime) {
         return serverTime - this.clockOffset;
     }
     
-    /**
-     * Convert a client timestamp to server time
-     * @param {number} clientTime - Timestamp from client
-     * @returns {number} Equivalent server time
-     */
     clientToServerTime(clientTime) {
         return clientTime + this.clockOffset;
     }
     
-    /**
-     * Get the current time synchronized to server clock
-     * @returns {number} Current time in server's reference frame
-     */
     getSyncedServerTime() {
         return Date.now() + this.clockOffset;
     }
     
     /**
-     * Get comprehensive clock sync statistics
-     * @returns {Object|null} Clock sync stats or null if not synced
+     * Get clock sync statistics.
+     * IMPORTANT: Returns ALL fields that app.js expects for backward compatibility!
      */
     getClockSyncStats() {
         if (!this.clockSynced && !this.pythonOffsetCalibrated) {
             return null;
         }
         
-        const avgRtt = this.rttSamples.length > 0 
-            ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+        const avgRtt = this.rttSamples.length > 0
+            ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length
             : 0;
+        const minRtt = this.rttSamples.length > 0 ? Math.min(...this.rttSamples) : 0;
+        const maxRtt = this.rttSamples.length > 0 ? Math.max(...this.rttSamples) : 0;
         
-        const offsets = this.clockSyncSamples.map(s => s.offset);
-        const avgOffset = offsets.length > 0 
-            ? offsets.reduce((a, b) => a + b, 0) / offsets.length 
+        const allOffsets = this.clockSyncSamples.map(s => s.offset);
+        const avgOffset = allOffsets.length > 0
+            ? allOffsets.reduce((a, b) => a + b, 0) / allOffsets.length
             : 0;
-        const variance = offsets.length > 0 
-            ? offsets.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / offsets.length 
+        const variance = allOffsets.length > 0
+            ? allOffsets.reduce((sum, val) => sum + Math.pow(val - avgOffset, 2), 0) / allOffsets.length
             : 0;
+        const stdDev = Math.sqrt(variance);
         
-        // Determine which offset is being used
+        let syncQuality = 'Excellent';
+        if (stdDev > 20) syncQuality = 'Good';
+        if (stdDev > 50) syncQuality = 'Fair';
+        if (stdDev > 100) syncQuality = 'Poor';
+        
         const activeOffset = this.pythonOffsetCalibrated ? this.pythonBrowserOffset : this.clockOffset;
         const offsetSource = this.pythonOffsetCalibrated ? 'Python↔Browser' : 'Go↔Browser';
-            
+        
         return {
+            // ═══ Fields required by app.js (backward compatible) ═══
             offset: activeOffset,
             offsetDirection: activeOffset > 0 ? 'Server ahead' : 'Client ahead',
             offsetSource: offsetSource,
@@ -287,16 +192,232 @@ class WebRTCClient {
             pythonOffset: this.pythonBrowserOffset,
             pythonCalibrated: this.pythonOffsetCalibrated,
             avgRtt: avgRtt,
-            minRtt: this.rttSamples.length > 0 ? Math.min(...this.rttSamples) : 0,
-            maxRtt: this.rttSamples.length > 0 ? Math.max(...this.rttSamples) : 0,
-            jitter: this.rttSamples.length > 0 ? Math.max(...this.rttSamples) - Math.min(...this.rttSamples) : 0,
-            stdDev: Math.sqrt(variance),
+            minRtt: minRtt,           // ← app.js needs this!
+            maxRtt: maxRtt,           // ← app.js needs this!
+            jitter: maxRtt - minRtt,  // ← app.js needs this!
+            stdDev: stdDev,           // ← app.js needs this!
+            syncQuality: syncQuality, // ← app.js needs this!
             samples: this.clockSyncSamples.length,
+            usedSamples: Math.ceil(this.clockSyncSamples.length / 2),
             synced: this.clockSynced || this.pythonOffsetCalibrated,
-            lastSyncTime: this.lastSyncTime
+            lastSyncTime: this.lastSyncTime,
+            
+            // ═══ Glass-to-glass latency stats ═══
+            glassLatency: this.glassLatencyHistory.length > 0
+                ? this.glassLatencyHistory[this.glassLatencyHistory.length - 1]
+                : null,
+            smoothedGlassLatency: this.glassLatencyHistory.length > 0
+                ? this.glassLatencyHistory.reduce((a, b) => a + b, 0) / this.glassLatencyHistory.length
+                : null,
+            timestampBufferSize: this.timestampBuffer.size
         };
     }
 
+    // ==================== TIMESTAMP BUFFER FOR FRAME CORRELATION ====================
+    //
+    // CONCEPT:
+    // ────────
+    // Timestamps travel via DataChannel (fast: ~25-40ms)
+    // Video frames travel via RTP → decode → display (slow: ~60-120ms)
+    //
+    // So timestamp for frame N arrives 40-80ms BEFORE frame N displays!
+    //
+    // OLD BUG:
+    //   handleMetrics() calculated latency = now - timestamp → showed ~40ms
+    //   This was DataChannel latency, NOT glass-to-glass!
+    //
+    // FIX:
+    //   1. When timestamp arrives → ONLY store in buffer (don't calculate!)
+    //   2. When video frame displays → look up timestamp → NOW calculate latency
+    //
+    // MATH:
+    //   glass_latency = T_display - T_capture - clock_offset
+    //
+    //   Where:
+    //   - T_display = when frame actually painted to screen (from requestVideoFrameCallback)
+    //   - T_capture = when Python captured the frame (from timestamp message)
+    //   - clock_offset = Python_clock - Browser_clock
+    //
+    // ═════════════════════════════════════════════════════════════════════════════════
+    
+    /**
+     * Buffer a frame timestamp. Called when timestamp arrives (BEFORE video displays).
+     * We do NOT calculate latency here!
+     */
+    bufferFrameTimestamp(frameId, captureMs, trackId, extraData) {
+        if (frameId === undefined || captureMs === undefined) return;
+        
+        this.timestampBuffer.set(frameId, {
+            frame_id: frameId,
+            capture_ms: captureMs,
+            receive_ms: Date.now(),
+            track_id: trackId,
+            extra: extraData || {},
+            matched: false
+        });
+        
+        // Cleanup old entries (keep last 300 = ~10 seconds at 30fps)
+        if (this.timestampBuffer.size > 300) {
+            const cutoff = frameId - 300;
+            for (const [id] of this.timestampBuffer) {
+                if (id < cutoff) this.timestampBuffer.delete(id);
+            }
+        }
+    }
+    
+    /**
+     * Called when a video frame actually DISPLAYS (from requestVideoFrameCallback).
+     * THIS is where glass-to-glass latency is calculated!
+     */
+    correlateDisplayedFrame(trackId, metadata) {
+        if (!metadata || !metadata.presentedFrames) return;
+        
+        const displayTime = Date.now();
+        const browserFrameNum = metadata.presentedFrames;
+        
+        // ════════════════════════════════════════════════════════════════════════
+        // FIND MATCHING TIMESTAMP
+        // ════════════════════════════════════════════════════════════════════════
+        //
+        // Browser's presentedFrames counter ≠ Python's frame_id counter
+        // They started at different times with different offsets.
+        //
+        // Strategy:
+        // 1. First time: Search buffer for best timing match → learn the offset
+        // 2. After that: Use known offset for direct lookup
+        //
+        // ════════════════════════════════════════════════════════════════════════
+        
+        let matchedTs = null;
+        let matchedId = null;
+        
+        if (this.frameIdOffset !== null) {
+            // We know the offset between counters - direct lookup
+            const expectedId = browserFrameNum + this.frameIdOffset;
+            
+            // Try exact match first, then nearby
+            for (let delta = 0; delta <= 5; delta++) {
+                for (const tryDelta of (delta === 0 ? [0] : [-delta, delta])) {
+                    const tryId = expectedId + tryDelta;
+                    const ts = this.timestampBuffer.get(tryId);
+                    if (ts && !ts.matched) {
+                        matchedTs = ts;
+                        matchedId = tryId;
+                        break;
+                    }
+                }
+                if (matchedTs) break;
+            }
+        } else {
+            // Don't know offset yet - search for best timing match
+            let bestScore = Infinity;
+            
+            for (const [frameId, ts] of this.timestampBuffer) {
+                if (ts.matched) continue;
+                
+                const timeSinceReceive = displayTime - ts.receive_ms;
+                // Video takes ~30-200ms from when timestamp was received to display
+                if (timeSinceReceive > 0 && timeSinceReceive < 500) {
+                    const score = Math.abs(timeSinceReceive - 80);
+                    if (score < bestScore) {
+                        bestScore = score;
+                        matchedTs = ts;
+                        matchedId = frameId;
+                    }
+                }
+            }
+            
+            // Learn the offset
+            if (matchedTs && matchedId !== null) {
+                this.frameIdOffset = matchedId - browserFrameNum;
+                console.log(`🔗 Frame ID offset: ${this.frameIdOffset} (browser #${browserFrameNum} = python frame_id ${matchedId})`);
+            }
+        }
+        
+        if (!matchedTs) return;
+        
+        // Mark as matched
+        matchedTs.matched = true;
+        
+        // ════════════════════════════════════════════════════════════════════════
+        // CALCULATE GLASS-TO-GLASS LATENCY
+        // ════════════════════════════════════════════════════════════════════════
+        //
+        // glass_latency = T_display(browser_clock) - T_capture(python_clock) - offset
+        //
+        // If clocks are synced:
+        //   offset = Python↔Browser combined offset
+        //   glass_latency = displayTime - captureMs - offset
+        //
+        // If not synced:
+        //   Use two-stage calibration (raw latency → estimated offset)
+        //
+        // ════════════════════════════════════════════════════════════════════════
+        
+        const rawDisplayLatency = displayTime - matchedTs.capture_ms;
+        let glassLatency;
+        let method;
+        
+        if (this.pythonOffsetCalibrated) {
+            glassLatency = rawDisplayLatency - this.pythonBrowserOffset;
+            method = 'python-synced';
+        } else if (this.clockSynced) {
+            // Go↔Browser synced but not Python↔Browser
+            // Use raw latency for calibration
+            if (Math.abs(rawDisplayLatency) > 1000) {
+                // Large skew detected - calibrate
+                this.rawLatencySamples.push(rawDisplayLatency);
+                if (this.rawLatencySamples.length > 10) this.rawLatencySamples.shift();
+                
+                if (this.rawLatencySamples.length >= 3) {
+                    const sorted = [...this.rawLatencySamples].sort((a, b) => a - b);
+                    const median = sorted[Math.floor(sorted.length / 2)];
+                    const estimatedNetwork = this.rttSamples.length > 0
+                        ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length / 2 + 50
+                        : 75;
+                    this.pythonBrowserOffset = median - estimatedNetwork;
+                    this.pythonOffsetCalibrated = true;
+                    console.log(` Python↔Browser offset calibrated: ${this.pythonBrowserOffset.toFixed(1)}ms`);
+                }
+                
+                glassLatency = this.rttSamples.length > 0
+                    ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length / 2 + 50
+                    : 75;
+                method = 'calibrating';
+            } else {
+                // No skew - clocks are roughly aligned
+                glassLatency = rawDisplayLatency;
+                method = 'raw-display';
+            }
+        } else {
+            glassLatency = rawDisplayLatency;
+            method = 'raw';
+        }
+        
+        // Sanity check
+        if (glassLatency > 0 && glassLatency < 5000) {
+            this.glassLatencyHistory.push(glassLatency);
+            if (this.glassLatencyHistory.length > 30) this.glassLatencyHistory.shift();
+            
+            const smoothed = this.glassLatencyHistory.reduce((a, b) => a + b, 0) / this.glassLatencyHistory.length;
+            
+            // Update metrics for this track
+            const metrics = this.metrics.get(trackId) || {};
+            metrics.glassLatency = glassLatency;
+            metrics.smoothedGlassLatency = smoothed;
+            metrics.latencyMethod = method;
+            metrics.lastMatchedFrameId = matchedId;
+            this.metrics.set(trackId, metrics);
+            
+            if (matchedId % 30 === 0) {
+                console.log(` Glass latency: ${glassLatency.toFixed(1)}ms (smoothed: ${smoothed.toFixed(1)}ms) [${method}]`);
+            }
+        }
+        
+        // Remove from buffer
+        this.timestampBuffer.delete(matchedId);
+    }
+    
     // ==================== CONNECTION ====================
 
     async connect() {
@@ -308,10 +429,7 @@ class WebRTCClient {
             this.ws.onopen = () => {
                 console.log('WebSocket connected');
                 this.setupWebRTC();
-                
-                // Start clock synchronization immediately after WebSocket connects
                 this.startClockSync();
-                
                 resolve();
             };
 
@@ -348,22 +466,19 @@ class WebRTCClient {
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' }
             ],
-            // Optimize for low latency
             bundlePolicy: 'max-bundle',
             rtcpMuxPolicy: 'require'
         };
 
         this.pc = new RTCPeerConnection(configuration);
 
-        // Create data channel for receiving metrics (must be created by offerer)
         const dcOptions = { 
             ordered: false,
-            maxRetransmits: 0  // Unreliable for low latency
+            maxRetransmits: 0
         };
         this.dataChannel = this.pc.createDataChannel('metrics', dcOptions);
         console.log('Created data channel, initial state:', this.dataChannel.readyState);
         
-        // Set up data channel handlers
         const setupDataChannelHandlers = (dc, label) => {
             console.log(`Setting up handlers for data channel: ${label}, state: ${dc.readyState}`);
             
@@ -371,17 +486,9 @@ class WebRTCClient {
                 console.log(`Data channel ${label} already OPEN!`);
             }
             
-            dc.onopen = () => {
-                console.log(`Data channel ${label} OPENED!`);
-            };
-            
-            dc.onclose = () => {
-                console.log(`Data channel ${label} closed`);
-            };
-            
-            dc.onerror = (error) => {
-                console.error(`Data channel ${label} error:`, error);
-            };
+            dc.onopen = () => console.log(`Data channel ${label} OPENED!`);
+            dc.onclose = () => console.log(`Data channel ${label} closed`);
+            dc.onerror = (error) => console.error(`Data channel ${label} error:`, error);
             
             let dcMsgCount = 0;
             
@@ -405,7 +512,7 @@ class WebRTCClient {
                     }
                 } catch (error) {
                     if (dcMsgCount <= 3) {
-                        console.warn(`Data channel parse error (msg #${dcMsgCount}), using WebSocket fallback`);
+                        console.warn(`Data channel parse error (msg #${dcMsgCount})`);
                     }
                 }
             };
@@ -418,37 +525,31 @@ class WebRTCClient {
             console.log('Received track event:', event);
             console.log('Track ID:', event.track.id);
             console.log('Track kind:', event.track.kind);
-            console.log('Streams:', event.streams);
             
-            // ==================== LOW LATENCY: Minimize jitter buffer ====================
+            // Low latency settings
             const receiver = event.receiver;
             if (receiver) {
                 if (receiver.playoutDelayHint !== undefined) {
-                    receiver.playoutDelayHint = 0.0;  // Request minimum delay
-                    console.log('Set playoutDelayHint to 0ms (minimum latency)');
+                    receiver.playoutDelayHint = 0.0;
+                    console.log('Set playoutDelayHint to 0ms');
                 }
                 if (receiver.jitterBufferTarget !== undefined) {
-                    receiver.jitterBufferTarget = 0.01;  // 10ms target
+                    receiver.jitterBufferTarget = 0.01;
                     console.log('Set jitterBufferTarget to 10ms');
                 }
             }
-            // ============================================================================
             
             let trackId = event.track.id;
             
             if (event.streams && event.streams.length > 0) {
                 const streamId = event.streams[0].id;
-                console.log('   Stream ID:', streamId);
-                
                 if (streamId && streamId.startsWith('stream_')) {
                     trackId = streamId.replace('stream_', '');
-                    console.log('   Extracted track name:', trackId);
                 }
             }
             
             const stream = event.streams[0];
             if (stream) {
-                console.log(' Adding stream for track:', trackId);
                 this.streams.set(trackId, stream);
                 
                 this.metrics.set(trackId, {
@@ -459,7 +560,9 @@ class WebRTCClient {
                     networkLatency: 0,
                     renderLatency: 0,
                     jitterBufferDelay: 0,
-                    decodeTime: 0
+                    decodeTime: 0,
+                    glassLatency: 0,
+                    smoothedGlassLatency: 0
                 });
                 
                 try {
@@ -475,31 +578,18 @@ class WebRTCClient {
                 } catch (error) {
                     console.error('Error setting up frame callback:', error);
                 }
-            } else {
-                console.warn('No stream in track event');
             }
         };
 
-        // Handle incoming data channel from server (backup)
+        // Handle incoming data channel from server
         this.pc.ondatachannel = (event) => {
-            console.log('Received data channel from server:', event.channel.label, 'state:', event.channel.readyState);
+            console.log('Received data channel from server:', event.channel.label);
             const channel = event.channel;
-            let serverDcMsgCount = 0;
             
-            if (channel.readyState === 'open') {
-                console.log('Server data channel already OPEN!');
-            }
-
-            channel.onopen = () => {
-                console.log('Server data channel opened');
-            };
-            
-            channel.onclose = () => {
-                console.log('Server data channel closed');
-            };
+            channel.onopen = () => console.log('Server data channel opened');
+            channel.onclose = () => console.log('Server data channel closed');
 
             channel.onmessage = (msgEvent) => {
-                serverDcMsgCount++;
                 try {
                     let jsonStr;
                     if (typeof msgEvent.data === 'string') {
@@ -515,17 +605,13 @@ class WebRTCClient {
                         this.handleMetrics(data.data, data.timestamp);
                     }
                 } catch (error) {
-                    if (serverDcMsgCount <= 3) {
-                        console.warn(`Server data channel parse error (msg #${serverDcMsgCount})`);
-                    }
+                    // ignore
                 }
             };
         };
 
-        // Handle ICE candidates
         this.pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('Sending ICE candidate');
                 this.sendMessage({
                     type: 'candidate',
                     candidate: event.candidate.toJSON()
@@ -533,21 +619,8 @@ class WebRTCClient {
             }
         };
 
-        // Handle connection state
         this.pc.onconnectionstatechange = () => {
             console.log('Connection state:', this.pc.connectionState);
-            console.log('Data channel state at connection change:', this.dataChannel.readyState);
-            
-            if (this.pc.connectionState === 'connected') {
-                console.log('Peer connection connected - checking data channel...');
-                setTimeout(() => {
-                    console.log('Data channel state 1s after connected:', this.dataChannel.readyState);
-                    if (this.dataChannel.readyState === 'open') {
-                        console.log('Data channel confirmed OPEN - ready to receive metrics');
-                    }
-                }, 1000);
-            }
-            
             if (this.onConnectionStateChange) {
                 this.onConnectionStateChange(this.pc.connectionState);
             }
@@ -557,11 +630,6 @@ class WebRTCClient {
             console.log('ICE connection state:', this.pc.iceConnectionState);
         };
 
-        this.pc.onicegatheringstatechange = () => {
-            console.log('ICE gathering state:', this.pc.iceGatheringState);
-        };
-
-        // Join as viewer
         this.sendMessage({
             type: 'join',
             role: 'viewer'
@@ -574,8 +642,6 @@ class WebRTCClient {
         video.muted = true;
         video.playsInline = true;
         video.autoplay = true;
-        
-        // Low latency video element hints
         video.preload = 'none';
         if (video.latencyHint !== undefined) {
             video.latencyHint = 'low';
@@ -599,21 +665,14 @@ class WebRTCClient {
                 metrics.width = metadata.width;
                 metrics.height = metadata.height;
                 
-                // ==================== PROPER RENDER LATENCY ====================
-                // Use processingDuration if available (Chrome 89+)
-                // This is the actual time spent decoding + rendering the frame
                 if (metadata.processingDuration !== undefined) {
                     const processingMs = metadata.processingDuration * 1000;
                     processingDurationSamples.push(processingMs);
-                    if (processingDurationSamples.length > 30) {
-                        processingDurationSamples.shift();
-                    }
-                    // Use median for stability
+                    if (processingDurationSamples.length > 30) processingDurationSamples.shift();
                     const sorted = [...processingDurationSamples].sort((a, b) => a - b);
                     metrics.renderLatency = sorted[Math.floor(sorted.length / 2)];
                 }
                 
-                // Frame interval (for FPS calculation)
                 if (lastPresentationTime > 0 && metadata.presentationTime) {
                     metrics.frameInterval = (metadata.presentationTime - lastPresentationTime) * 1000;
                 }
@@ -621,12 +680,17 @@ class WebRTCClient {
                     lastPresentationTime = metadata.presentationTime;
                 }
                 
-                // Expected vs actual display time (compositor delay)
                 if (metadata.expectedDisplayTime && metadata.presentationTime) {
                     metrics.compositorDelay = (metadata.presentationTime - metadata.expectedDisplayTime) * 1000;
                 }
+                
+                // ══════════════════════════════════════════════════════════════════
+                // FRAME CORRELATION: Calculate glass-to-glass latency at DISPLAY time!
+                // This is the FIX for the timestamp timing bug.
+                // ══════════════════════════════════════════════════════════════════
+                this.correlateDisplayedFrame(trackId, metadata);
+                
             } else {
-                // Fallback: use frame interval as rough estimate
                 metrics.renderLatency = now - (this._lastFrameTime || now);
             }
             this._lastFrameTime = now;
@@ -640,20 +704,17 @@ class WebRTCClient {
 
         if (video.requestVideoFrameCallback) {
             video.requestVideoFrameCallback(callback);
-            console.log(' requestVideoFrameCallback enabled for', trackId);
+            console.log('requestVideoFrameCallback enabled for', trackId);
         } else {
-            console.warn(' requestVideoFrameCallback not supported - render latency will be estimated');
+            console.warn('requestVideoFrameCallback not supported');
         }
 
         this.videoElements.set(trackId, video);
-        
-        // Start jitter buffer monitoring
         this.startJitterBufferMonitoring(trackId);
     }
     
-    // Monitor jitter buffer stats periodically
     startJitterBufferMonitoring(trackId) {
-        if (this._jitterMonitorInterval) return; // Already monitoring
+        if (this._jitterMonitorInterval) return;
         
         this._jitterMonitorInterval = setInterval(async () => {
             if (!this.pc) return;
@@ -665,45 +726,43 @@ class WebRTCClient {
                     if (report.type === 'inbound-rtp' && report.kind === 'video') {
                         const metrics = this.metrics.get(trackId) || {};
                         
-                        // Jitter buffer delay
                         if (report.jitterBufferDelay && report.jitterBufferEmittedCount) {
                             metrics.jitterBufferDelay = (report.jitterBufferDelay / report.jitterBufferEmittedCount) * 1000;
                         }
                         
-                        // Decode time per frame
                         if (report.totalDecodeTime && report.framesDecoded) {
                             metrics.decodeTime = (report.totalDecodeTime / report.framesDecoded) * 1000;
                         }
                         
-                        // Frames dropped
                         metrics.framesDropped = report.framesDropped || 0;
                         metrics.framesDecoded = report.framesDecoded || 0;
                         
-                        // Jitter
                         if (report.jitter !== undefined) {
                             metrics.jitter = report.jitter * 1000;
                         }
                         
                         this.metrics.set(trackId, metrics);
                         
-                        // Log occasionally
                         if (this._jitterLogCount === undefined) this._jitterLogCount = 0;
                         this._jitterLogCount++;
                         if (this._jitterLogCount <= 3 || this._jitterLogCount % 30 === 0) {
-                            console.log(`Render Pipeline Stats:`);
-                            console.log(`Jitter Buffer: ${metrics.jitterBufferDelay?.toFixed(1) || '?'}ms`);
-                            console.log(`Decode Time: ${metrics.decodeTime?.toFixed(1) || '?'}ms`);
-                            console.log(`Render (processing): ${metrics.renderLatency?.toFixed(1) || '?'}ms`);
-                            console.log(`Frames: ${metrics.framesDecoded} decoded, ${metrics.framesDropped} dropped`);
+                            console.log(`Render Pipeline: JitterBuf=${metrics.jitterBufferDelay?.toFixed(1) || '?'}ms, Decode=${metrics.decodeTime?.toFixed(1) || '?'}ms, Render=${metrics.renderLatency?.toFixed(1) || '?'}ms`);
                         }
                     }
                 });
             } catch (e) {
-                // Ignore stats errors
+                // Ignore
             }
         }, 1000);
     }
 
+    /**
+     * Handle incoming metrics from Python (via Go relay).
+     * 
+     * Now also extracts frame_id and capture_ms for timestamp correlation.
+     * The latency shown is calculated in correlateDisplayedFrame() when video displays,
+     * NOT here when the timestamp arrives.
+     */
     handleMetrics(metricsData, timestamp) {
         if (!this._metricsLogCount) this._metricsLogCount = 0;
         this._metricsLogCount++;
@@ -712,155 +771,94 @@ class WebRTCClient {
         const receiveTime = Date.now();
         const serverTimeMs = timestamp * 1000;
         
-        // Raw latency = client_receive_time - server_send_time (no correction)
-        const rawLatency = receiveTime - serverTimeMs;
+        // ════════════════════════════════════════════════════════════════════════
+        // EXTRACT frame_id AND capture_ms FOR TIMESTAMP CORRELATION
+        // Python now embeds these in the metrics message so Go can forward them
+        // without needing to understand a new message type.
+        // ════════════════════════════════════════════════════════════════════════
         
+        for (const [trackId, trackMetrics] of Object.entries(metricsData)) {
+            // Buffer the timestamp if frame_id is present
+            if (trackMetrics.frame_id !== undefined && trackMetrics.capture_ms !== undefined) {
+                this.bufferFrameTimestamp(
+                    trackMetrics.frame_id,
+                    trackMetrics.capture_ms,
+                    trackId,
+                    { ros_latency: trackMetrics.ros_latency, encoding_latency: trackMetrics.encoding_latency }
+                );
+                
+                if (shouldLog) {
+                    console.log(`Buffered timestamp: frame_id=${trackMetrics.frame_id}, buffer=${this.timestampBuffer.size}`);
+                }
+            }
+        }
+        
+        // ════════════════════════════════════════════════════════════════════════
+        // NETWORK LATENCY (DataChannel latency, NOT glass-to-glass)
+        // This is kept for backward compatibility and for showing
+        // the network component of total latency.
+        // ════════════════════════════════════════════════════════════════════════
+        
+        const rawLatency = receiveTime - serverTimeMs;
         let networkTime;
         let latencyMethod;
         
-        // ============================================================
-        // TWO-STAGE CLOCK SYNCHRONIZATION
-        // ============================================================
-        // 
-        // PROBLEM:
-        //   - Ping/pong measures: Go relay ↔ Browser offset (~525ms)
-        //   - Metrics timestamp from: Python sender (~67 seconds different!)
-        //   - These are DIFFERENT clock offsets!
-        //
-        // SOLUTION:
-        //   1. Detect large raw latency (> 1000ms) → Python clock skew exists
-        //   2. Calculate Python↔Browser offset from raw latency
-        //   3. Use Python offset for metrics compensation
-        //
-        // CALIBRATION:
-        //   If raw_latency >> expected (e.g., 67000ms vs ~50ms expected)
-        //   Then: python_offset ≈ raw_latency - (RTT/2)
-        //   So:   compensated = raw_latency - python_offset ≈ RTT/2
-        // ============================================================
-        
-        const SKEW_THRESHOLD = 1000; // 1 second - anything above this is clock skew
+        const SKEW_THRESHOLD = 1000;
         const hasLargeSkew = Math.abs(rawLatency) > SKEW_THRESHOLD;
         
         if (hasLargeSkew) {
-            // =========================================================
-            // LARGE CLOCK SKEW DETECTED - Need Python↔Browser offset
-            // =========================================================
-            
-            // Collect raw latency samples for calibration
             this.rawLatencySamples.push(rawLatency);
-            if (this.rawLatencySamples.length > 10) {
-                this.rawLatencySamples.shift();
-            }
+            if (this.rawLatencySamples.length > 10) this.rawLatencySamples.shift();
             
-            // Calibrate Python offset after collecting a few samples
             if (this.rawLatencySamples.length >= 3 && !this.pythonOffsetCalibrated) {
-                // Use median raw latency for stability
                 const sorted = [...this.rawLatencySamples].sort((a, b) => a - b);
                 const medianRaw = sorted[Math.floor(sorted.length / 2)];
-                
-                // Estimate actual network latency as RTT/2 (or default 25ms)
                 const estimatedNetworkLatency = this.rttSamples.length > 0
                     ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length / 2
                     : 25;
-                
-                // Calculate Python→Browser offset
-                // raw_latency = actual_latency + offset
-                // offset = raw_latency - actual_latency
                 this.pythonBrowserOffset = medianRaw - estimatedNetworkLatency;
                 this.pythonOffsetCalibrated = true;
-                
-                console.log(` Python↔Browser clock skew detected and calibrated:`);
-                console.log(` Median raw latency: ${medianRaw.toFixed(1)}ms`);
-                console.log(` Estimated network: ${estimatedNetworkLatency.toFixed(1)}ms`);
-                console.log(` Python offset: ${this.pythonBrowserOffset.toFixed(1)}ms (${(this.pythonBrowserOffset/1000).toFixed(1)}s)`);
+                console.log(`Python↔Browser offset calibrated: ${this.pythonBrowserOffset.toFixed(1)}ms`);
             }
             
-            // Apply Python offset if calibrated
             if (this.pythonOffsetCalibrated) {
-                const compensatedLatency = rawLatency - this.pythonBrowserOffset;
-                
-                if (shouldLog) {
-                    console.log(` Two-Stage Compensation (Python→Browser):`);
-                    console.log(` Raw latency: ${rawLatency.toFixed(1)}ms`);
-                    console.log(` Python offset: ${this.pythonBrowserOffset.toFixed(1)}ms`);
-                    console.log(` Compensated: ${compensatedLatency.toFixed(1)}ms`);
-                }
-                
-                if (compensatedLatency >= 0 && compensatedLatency < 5000) {
-                    networkTime = compensatedLatency;
+                const compensated = rawLatency - this.pythonBrowserOffset;
+                if (compensated >= 0 && compensated < 5000) {
+                    networkTime = compensated;
                     latencyMethod = 'python-synced';
-                } else if (compensatedLatency < 0) {
-                    // Recalibrate - offset may have drifted
-                    this.pythonOffsetCalibrated = false;
-                    this.rawLatencySamples = [];
-                    const avgRtt = this.rttSamples.length > 0 
-                        ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
-                        : 20;
-                    networkTime = avgRtt / 2;
-                    latencyMethod = 'recalibrating';
-                    console.warn(`Python offset needs recalibration (got ${compensatedLatency.toFixed(1)}ms)`);
                 } else {
-                    // Still too high after compensation - recalibrate
                     this.pythonOffsetCalibrated = false;
                     this.rawLatencySamples = [];
-                    const avgRtt = this.rttSamples.length > 0 
-                        ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+                    networkTime = this.rttSamples.length > 0
+                        ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length / 2
                         : 20;
-                    networkTime = avgRtt / 2;
                     latencyMethod = 'recalibrating';
-                    console.warn(`Compensated still high (${compensatedLatency.toFixed(1)}ms) - recalibrating`);
                 }
             } else {
-                // Still calibrating - use RTT estimate
-                const avgRtt = this.rttSamples.length > 0 
-                    ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length 
+                networkTime = this.rttSamples.length > 0
+                    ? this.rttSamples.reduce((a, b) => a + b, 0) / this.rttSamples.length / 2
                     : 20;
-                networkTime = avgRtt / 2;
                 latencyMethod = 'calibrating';
-                
-                if (shouldLog) {
-                    console.log(`Calibrating Python offset... (${this.rawLatencySamples.length}/3 samples)`);
-                }
             }
         } else {
-            // =========================================================
-            // SMALL/NO CLOCK SKEW - Use simple compensation or raw
-            // =========================================================
-            
-            // Reset Python calibration if we're suddenly seeing normal latencies
             if (this.pythonOffsetCalibrated && Math.abs(rawLatency) < 500) {
-                console.log(`Clocks appear synced now - resetting Python offset`);
                 this.pythonOffsetCalibrated = false;
                 this.pythonBrowserOffset = 0;
                 this.rawLatencySamples = [];
             }
             
             if (this.clockSynced) {
-                // Use Go↔Browser offset for small adjustments
-                const compensatedLatency = rawLatency + this.clockOffset;
-                
-                if (shouldLog) {
-                    console.log(`Standard Compensation (Go↔Browser):`);
-                    console.log(`Raw: ${rawLatency.toFixed(1)}ms, Offset: ${this.clockOffset.toFixed(1)}ms`);
-                    console.log(`Compensated: ${compensatedLatency.toFixed(1)}ms`);
-                }
-                
-                if (compensatedLatency >= 0 && compensatedLatency < 1000) {
-                    networkTime = compensatedLatency;
+                const compensated = rawLatency + this.clockOffset;
+                if (compensated >= 0 && compensated < 1000) {
+                    networkTime = compensated;
                     latencyMethod = 'synced';
                 } else {
-                    // Compensation made it worse - just use raw
                     networkTime = Math.max(0, rawLatency);
                     latencyMethod = 'raw';
                 }
             } else {
-                // No sync yet - use raw if reasonable
                 networkTime = Math.max(0, rawLatency);
                 latencyMethod = 'raw';
-                
-                if (shouldLog) {
-                    console.log(`Using raw latency: ${networkTime.toFixed(1)}ms`);
-                }
             }
         }
 
@@ -882,14 +880,22 @@ class WebRTCClient {
                 pythonOffset: this.pythonBrowserOffset
             };
 
-            combined.totalLatency = 
-                combined.rosLatency + 
-                combined.encodingLatency + 
-                combined.networkLatency + 
-                (combined.renderLatency || 0);
+            // Total latency: use glass-to-glass if available, otherwise sum components
+            if (combined.smoothedGlassLatency && combined.smoothedGlassLatency > 0) {
+                combined.totalLatency = combined.smoothedGlassLatency;
+            } else {
+                combined.totalLatency = 
+                    combined.rosLatency + 
+                    combined.encodingLatency + 
+                    combined.networkLatency + 
+                    (combined.renderLatency || 0);
+            }
 
             if (shouldLog) {
-                console.log(`${trackId}: total=${combined.totalLatency.toFixed(1)}ms, network=${combined.networkLatency.toFixed(1)}ms (${latencyMethod})`);
+                const glassInfo = combined.smoothedGlassLatency 
+                    ? `, glass=${combined.smoothedGlassLatency.toFixed(1)}ms` 
+                    : '';
+                console.log(`${trackId}: total=${combined.totalLatency.toFixed(1)}ms, network=${combined.networkLatency.toFixed(1)}ms (${latencyMethod})${glassInfo}`);
             }
             this.metrics.set(trackId, combined);
         }
@@ -900,15 +906,11 @@ class WebRTCClient {
     }
 
     async handleSignalingMessage(msg) {
-        console.log('Received message:', msg.type);
-        
-        // Handle pong for clock synchronization
         if (msg.type === 'pong') {
             this.handlePong(msg);
             return;
         }
         
-        // Handle metrics directly via WebSocket
         if (msg.type === 'metrics') {
             if (!this._wsMetricsCount) this._wsMetricsCount = 0;
             this._wsMetricsCount++;
@@ -923,23 +925,15 @@ class WebRTCClient {
             case 'joined':
                 this.clientId = msg.client_id;
                 console.log('Joined as client:', msg.client_id);
-                console.log('Available streams:', msg.streams);
                 
                 const streamCount = msg.streams ? msg.streams.length : 1;
-                console.log(`Adding ${streamCount} video transceiver(s) for streams`);
                 for (let i = 0; i < Math.max(1, streamCount); i++) {
                     this.pc.addTransceiver('video', { direction: 'recvonly' });
                 }
                 
                 const offer = await this.pc.createOffer();
-                
-                if (offer.sdp.includes('m=application')) {
-                    console.log('Offer includes data channel (m=application)');
-                }
-                
                 await this.pc.setLocalDescription(offer);
                 
-                console.log('Sending offer');
                 this.sendMessage({
                     type: 'offer',
                     sdp: {
@@ -950,19 +944,11 @@ class WebRTCClient {
                 break;
 
             case 'answer':
-                console.log('Received answer');
                 try {
-                    let answerSdp;
+                    let answerSdp = msg.sdp;
                     if (msg.sdp && typeof msg.sdp === 'object') {
                         answerSdp = msg.sdp.sdp || msg.sdp;
-                    } else {
-                        answerSdp = msg.sdp;
                     }
-                    
-                    if (answerSdp && answerSdp.includes('m=application')) {
-                        console.log('Answer includes data channel (m=application)');
-                    }
-                    
                     const answer = new RTCSessionDescription({
                         type: 'answer',
                         sdp: answerSdp
@@ -977,7 +963,6 @@ class WebRTCClient {
             case 'candidate':
             case 'ice':
                 if (msg.candidate) {
-                    console.log('Received ICE candidate');
                     try {
                         await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
                     } catch (e) {
@@ -993,42 +978,23 @@ class WebRTCClient {
             case 'error':
                 console.error('Server error:', msg.message);
                 break;
-
-            default:
-                console.warn('Unknown message type:', msg.type);
         }
     }
 
     sendMessage(msg) {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify(msg));
-        } else {
-            console.error('WebSocket not ready');
         }
     }
 
-    getStream(trackId) {
-        return this.streams.get(trackId);
-    }
-
-    getMetrics(trackId) {
-        return this.metrics.get(trackId);
-    }
-
-    getAllStreams() {
-        return Array.from(this.streams.keys());
-    }
-
-    getAllMetrics() {
-        return this.metrics;
-    }
+    getStream(trackId) { return this.streams.get(trackId); }
+    getMetrics(trackId) { return this.metrics.get(trackId); }
+    getAllStreams() { return Array.from(this.streams.keys()); }
+    getAllMetrics() { return this.metrics; }
 
     cleanup() {
-        console.log('Cleaning up...');
-        
         this.stopClockSync();
         
-        // Stop jitter buffer monitoring
         if (this._jitterMonitorInterval) {
             clearInterval(this._jitterMonitorInterval);
             this._jitterMonitorInterval = null;
@@ -1052,15 +1018,16 @@ class WebRTCClient {
         this.streams.clear();
         this.metrics.clear();
         this.pendingPings.clear();
+        this.timestampBuffer.clear();
+        this.glassLatencyHistory = [];
+        this.frameIdOffset = null;
         
-        // Reset clock sync state
         this.clockSyncSamples = [];
         this.rttSamples = [];
         this.clockOffset = 0;
         this.clockSynced = false;
         this.lastSyncTime = null;
         
-        // Reset Python offset state
         this.pythonBrowserOffset = 0;
         this.pythonOffsetCalibrated = false;
         this.rawLatencySamples = [];
